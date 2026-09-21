@@ -352,8 +352,17 @@ export class PiWebApp extends LitElement {
     this.navigationSelectionSeq += 1;
   }
 
+  private readonly resetKeyboardSequence = () => { this.keyboard.reset(); };
+
   private readonly onKeyDown = (event: KeyboardEvent) => {
-    if (this.isRenderedModalOpen()) return;
+    if (this.isRenderedModalOpen()) {
+      this.keyboard.reset();
+      return;
+    }
+    if (this.promptEditor?.ownsKeyboardEvent(event) === true) {
+      this.keyboard.reset();
+      return;
+    }
     if (this.keyboard.handle(event, this.getDefaultActions(), { shortcuts: this.shortcutConfig })) {
       event.preventDefault();
       event.stopPropagation();
@@ -435,6 +444,8 @@ export class PiWebApp extends LitElement {
     window.addEventListener("pageshow", this.onPageShow);
     this.browserResume.connect();
     window.addEventListener("keydown", this.onKeyDown, GLOBAL_SHORTCUT_LISTENER_OPTIONS);
+    window.addEventListener("focusin", this.resetKeyboardSequence);
+    window.addEventListener("blur", this.resetKeyboardSequence);
     this.systemLightThemeMedia?.addEventListener("change", this.onSystemLightThemeChange);
     this.applyPreferredTheme(false);
     this.connectRealtime();
@@ -455,6 +466,8 @@ export class PiWebApp extends LitElement {
     window.removeEventListener("pageshow", this.onPageShow);
     this.browserResume.disconnect();
     window.removeEventListener("keydown", this.onKeyDown, GLOBAL_SHORTCUT_LISTENER_OPTIONS);
+    window.removeEventListener("focusin", this.resetKeyboardSequence);
+    window.removeEventListener("blur", this.resetKeyboardSequence);
     this.systemLightThemeMedia?.removeEventListener("change", this.onSystemLightThemeChange);
     this.keyboard.reset();
     // A custom element can be removed before its constructor-scheduled built-in
@@ -509,7 +522,7 @@ export class PiWebApp extends LitElement {
     if (!this.routeLocationMatchesUrl(route)) {
       await this.projects.loadProjects();
       await this.withChatScrollTransition(async () => { await this.restoreRoute(false); });
-      await this.refreshWorkspaceDeletionRuns();
+      void this.refreshWorkspaceDeletionRuns();
       return;
     }
     const effectiveRoute = this.routeForSelectedMachine(route);
@@ -520,7 +533,7 @@ export class PiWebApp extends LitElement {
     // route to reconciliation while it is still the current destination.
     if (!this.routeLocationMatchesUrl(effectiveRoute)) {
       await this.withChatScrollTransition(async () => { await this.restoreRoute(false); });
-      await this.refreshWorkspaceDeletionRuns();
+      void this.refreshWorkspaceDeletionRuns();
       return;
     }
     await this.withChatScrollTransition(() => this.restoreRouteFor(effectiveRoute, false));
@@ -529,7 +542,7 @@ export class PiWebApp extends LitElement {
       this.clearPendingRemoteRouteRestore();
       this.rememberCurrentMachineNavigation();
     }
-    await this.refreshWorkspaceDeletionRuns();
+    void this.refreshWorkspaceDeletionRuns();
   }
 
   private handleBrowserResumeSignal(): void {
@@ -542,11 +555,15 @@ export class PiWebApp extends LitElement {
     await this.sessionUnread.refreshAll();
     await Promise.all([
       this.sessions.refreshSelectedSession(),
-      this.refreshMachineStatusSnapshots(),
-      this.refreshWorkspaceDeletionRuns(),
       this.refreshCurrentWorkspaceSurface(),
       this.workspaces.refreshSelectedProjectTopology(),
     ]);
+    void Promise.all([
+      this.refreshMachineStatusSnapshots(),
+      this.refreshWorkspaceDeletionRuns(),
+    ]).catch((error: unknown) => {
+      console.warn("Failed to refresh background browser-resume data", error);
+    });
   }
 
   /** Poll idle external sessions without overlapping work or waking hidden tabs. */
@@ -2726,8 +2743,12 @@ export class PiWebApp extends LitElement {
 
       const composition = this.requiredTerminalComposition(machineId);
       const filter = workspaceDeletionRunFilter();
+      const selectedWorkspace = this.state.selectedWorkspace?.projectId === project.id ? this.state.selectedWorkspace : undefined;
+      // Deletion polling is UI-scoped: the selected workspace is the only one
+      // that can affect the current route. Explicitly pending runs remain
+      // tracked even when their originating workspace is no longer selected.
       const queryWorkspaces: Pick<Workspace, "id" | "projectId">[] = pendingRuns.length === 0
-        ? this.state.workspaces.filter((workspace) => workspace.projectId === project.id)
+        ? selectedWorkspace === undefined ? [] : [{ id: selectedWorkspace.id, projectId: selectedWorkspace.projectId }]
         : [...new Map(pendingRuns.map((run) => [run.workspaceId, { id: run.workspaceId, projectId: run.projectId }])).values()];
       const results = await Promise.allSettled(queryWorkspaces.map(async (workspace) => {
         const peer = createPluginPeer(composition.binding, workspace, machineId);
@@ -3354,7 +3375,7 @@ export class PiWebApp extends LitElement {
           <div class="mobile-navigation-panel">${this.appShell.isMobileNavigationLayout ? this.renderNavigationPanel() : null}</div>
           ${state.selectedSession ? html`
             ${this.renderChatView(state, state.selectedSession)}
-            <prompt-editor .sessionId=${state.selectedSession.id} .cwd=${state.selectedWorkspace?.path} .machineId=${selectedMachineId(state)} .projectId=${state.selectedWorkspace?.projectId} .workspaceId=${state.selectedWorkspace?.id} .attachmentsFolder=${workspaceEffectiveAttachmentsFolder(state.selectedWorkspace?.effectiveConfig, this.workspaceAttachmentsDefaultFolder)} .disabled=${state.selectedSession.archived === true} .canSteer=${state.status?.isStreaming === true} .isCompacting=${state.status?.isCompacting === true} .canStop=${state.status?.isStreaming === true || state.status?.isBashRunning === true || state.status?.isCompacting === true || (state.status?.pendingMessageCount ?? 0) > 0} .status=${state.status} .availableThinkingLevels=${state.availableThinkingLevels} .sending=${state.sendingPrompts[state.selectedSession.id] === true} .onSend=${this.handleSendPrompt} .onStop=${this.handleStopActiveWork} .onSelectModel=${this.handleSelectModel} .onSelectThinking=${this.handleSelectThinking}></prompt-editor>
+            <prompt-editor .shortcuts=${this.shortcutConfig} .sessionId=${state.selectedSession.id} .cwd=${state.selectedWorkspace?.path} .machineId=${selectedMachineId(state)} .projectId=${state.selectedWorkspace?.projectId} .workspaceId=${state.selectedWorkspace?.id} .attachmentsFolder=${workspaceEffectiveAttachmentsFolder(state.selectedWorkspace?.effectiveConfig, this.workspaceAttachmentsDefaultFolder)} .disabled=${state.selectedSession.archived === true} .canSteer=${state.status?.isStreaming === true} .isCompacting=${state.status?.isCompacting === true} .canStop=${state.status?.isStreaming === true || state.status?.isBashRunning === true || state.status?.isCompacting === true || (state.status?.pendingMessageCount ?? 0) > 0} .status=${state.status} .availableThinkingLevels=${state.availableThinkingLevels} .sending=${state.sendingPrompts[state.selectedSession.id] === true} .onSend=${this.handleSendPrompt} .onStop=${this.handleStopActiveWork} .onSelectModel=${this.handleSelectModel} .onSelectThinking=${this.handleSelectThinking}></prompt-editor>
             ${this.renderStatusBar(state)}
             ${state.commandDialog !== undefined ? html`<command-picker .title=${state.commandDialog.title} .options=${state.commandDialog.options} .onPick=${(value: string) => this.sessions.respondToCommand(state.commandDialog?.requestId ?? "", value)} .onCancel=${() => { this.sessions.cancelCommand(); }}></command-picker>` : null}
             ${state.modelDialog !== undefined ? html`<model-picker title=${state.modelDialog.title} .options=${state.modelDialog.options} .catalog=${state.modelDialog.catalog} .defaultValue=${state.modelDialog.defaultValue} .defaultsLoading=${state.modelDialog.defaultsLoading === true} .onSetDefault=${this.handleSetDefaultModel} .selectedValue=${state.modelDialog.selectedValue} .onPick=${(value: string) => { void this.pickModel(value); }} .onToggleEnabled=${this.handleToggleModelEnabled} .onSetScope=${this.handleSetModelScope} .onCancel=${() => { this.setState({ modelDialog: undefined }); }}></model-picker>` : null}

@@ -15,15 +15,27 @@ import { promptArgumentHintExtension, setPromptArgumentHint } from "../promptArg
 import { clearDraft, loadDraft, saveDraft } from "../promptDraftStorage";
 import { clearStagedAttachments, loadStagedAttachments, saveStagedAttachments, type PendingAttachment } from "../promptAttachmentStaging";
 import { loadAttachmentDelivery, saveAttachmentDelivery } from "../attachmentPreferences";
-import { createMobilePromptEnterMedia, readPromptEnterPreference, shouldSendPromptOnEnterShortcut, shouldUsePromptEnterShiftShortcut } from "../promptEnterBehavior";
+import { createMobilePromptEnterMedia, shouldUsePromptEnterShiftShortcut } from "../promptEnterBehavior";
+import { composerSendShortcut, matchesComposerSend } from "../composerShortcuts";
+import type { ShortcutPreferenceConfig } from "../keyboardShortcuts";
 import { promptEditorStyles, type CompletionItem } from "./shared";
 import { renderAttachIcon, renderSendIcon, renderQueueIcon, renderSteerIcon, renderStopIcon, renderThinkingGauge } from "./promptEditorIcons";
 import { thinkingGauge, thinkingLevelLabel } from "../../../shared/thinkingLevels";
 import "./AutocompleteMenu";
 
+const FILE_COMPLETION_DEBOUNCE_MS = 150;
+const FILE_COMPLETION_CACHE_TTL_MS = 5_000;
+const MAX_FILE_COMPLETION_CACHE_ENTRIES = 64;
+
+interface CachedFileCompletions {
+  expiresAt: number;
+  files: FileSuggestion[];
+}
+
 @customElement("prompt-editor")
 export class PromptEditor extends LitElement {
   @property({ type: Boolean }) disabled = false;
+  @property({ attribute: false }) shortcuts: ShortcutPreferenceConfig = {};
   @property() sessionId?: string;
   @property() cwd?: string;
   @property() machineId = "local";
@@ -62,6 +74,9 @@ export class PromptEditor extends LitElement {
   @state() private attachmentError: string | undefined = undefined;
   private attachmentSeq = 0;
   private requestVersion = 0;
+  private completionRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  private fileCompletionAbortController: AbortController | undefined;
+  private readonly fileCompletionCache = new Map<string, CachedFileCompletions>();
   private editor: EditorView | undefined;
   private readonly editableCompartment = new Compartment();
   private readonly readOnlyCompartment = new Compartment();
@@ -84,6 +99,8 @@ export class PromptEditor extends LitElement {
     this.currentInputMode = inputModeForDraft(this.draft);
     this.completions = [];
     this.selectedIndex = 0;
+    this.cancelCompletionRefresh();
+    this.requestVersion += 1;
   }
 
   protected override shouldUpdate(changed: PropertyValues<this>): boolean {
@@ -107,6 +124,7 @@ export class PromptEditor extends LitElement {
   }
 
   override disconnectedCallback(): void {
+    this.cancelCompletionRefresh();
     this.editor?.destroy();
     this.editor = undefined;
     super.disconnectedCallback();
@@ -158,6 +176,7 @@ export class PromptEditor extends LitElement {
 
     // Invalidate completion requests started for either the previous document or
     // the replacement dispatch, then return the editor to a clean completion state.
+    this.cancelCompletionRefresh();
     this.requestVersion += 1;
     this.currentInputMode = inputModeForDraft(text);
     this.completions = [];
@@ -343,13 +362,35 @@ export class PromptEditor extends LitElement {
     if (key !== undefined) saveDraft(key, this.draft);
     const nextInputMode = inputModeForDraft(this.draft);
     if (!inputModesEqual(nextInputMode, this.currentInputMode)) this.currentInputMode = nextInputMode;
-    void this.refreshCompletions();
+    this.scheduleCompletionsRefresh();
+  }
+
+  private scheduleCompletionsRefresh(): void {
+    if (this.completionRefreshTimer !== undefined) clearTimeout(this.completionRefreshTimer);
+    this.requestVersion += 1;
+    this.fileCompletionAbortController?.abort();
+    this.fileCompletionAbortController = undefined;
+    const trigger = this.currentTrigger();
+    if (trigger?.kind !== "file") {
+      void this.refreshCompletions();
+      return;
+    }
+    this.completionRefreshTimer = setTimeout(() => {
+      this.completionRefreshTimer = undefined;
+      void this.refreshCompletions();
+    }, FILE_COMPLETION_DEBOUNCE_MS);
   }
 
   private async refreshCompletions() {
+    if (this.completionRefreshTimer !== undefined) {
+      clearTimeout(this.completionRefreshTimer);
+      this.completionRefreshTimer = undefined;
+    }
     const trigger = this.currentTrigger();
     const version = ++this.requestVersion;
     this.selectedIndex = 0;
+    this.fileCompletionAbortController?.abort();
+    this.fileCompletionAbortController = trigger?.kind === "file" ? new AbortController() : undefined;
     if (trigger === undefined) {
       this.completions = [];
       return;
@@ -369,7 +410,32 @@ export class PromptEditor extends LitElement {
           ...(command.argumentHint === undefined ? {} : { argumentHint: command.argumentHint }),
         }));
     } else if (trigger.kind === "file" && this.projectId !== undefined && this.workspaceId !== undefined) {
-      const files = await api.files(trigger.query, { scope: trigger.fileScope, machineId: this.machineId, projectId: this.projectId, workspaceId: this.workspaceId }).catch(emptyFileSuggestions);
+      const cacheKey = fileCompletionCacheKey(this.machineId, this.projectId, this.workspaceId, trigger.fileScope, trigger.query);
+      const cached = this.fileCompletionCache.get(cacheKey);
+      let files: FileSuggestion[];
+      if (cached !== undefined && cached.expiresAt > Date.now()) {
+        files = cached.files;
+      } else {
+        try {
+          files = await api.files(trigger.query, {
+            scope: trigger.fileScope,
+            machineId: this.machineId,
+            projectId: this.projectId,
+            workspaceId: this.workspaceId,
+            signal: this.fileCompletionAbortController?.signal,
+          });
+          this.fileCompletionCache.delete(cacheKey);
+          this.fileCompletionCache.set(cacheKey, { expiresAt: Date.now() + FILE_COMPLETION_CACHE_TTL_MS, files });
+          while (this.fileCompletionCache.size > MAX_FILE_COMPLETION_CACHE_ENTRIES) {
+            const oldestKey = this.fileCompletionCache.keys().next().value;
+            if (oldestKey === undefined) break;
+            this.fileCompletionCache.delete(oldestKey);
+          }
+        } catch (error) {
+          if (isAbortError(error)) return;
+          files = emptyFileSuggestions();
+        }
+      }
       if (version !== this.requestVersion) return;
       this.completions = files
         .slice(0, 12)
@@ -396,6 +462,15 @@ export class PromptEditor extends LitElement {
     }
   }
 
+  private cancelCompletionRefresh(): void {
+    if (this.completionRefreshTimer !== undefined) {
+      clearTimeout(this.completionRefreshTimer);
+      this.completionRefreshTimer = undefined;
+    }
+    this.fileCompletionAbortController?.abort();
+    this.fileCompletionAbortController = undefined;
+  }
+
   private currentTrigger(): PromptCompletionTrigger | undefined {
     return detectPromptCompletionTrigger(this.draft, this.editor?.state.selection.main.head ?? this.draft.length);
   }
@@ -412,20 +487,45 @@ export class PromptEditor extends LitElement {
     return true;
   }
 
+  /** The capture-phase app dispatcher must leave composer-owned keys to CodeMirror. */
+  ownsKeyboardEvent(event: KeyboardEvent): boolean {
+    if (this.editor === undefined || !event.composedPath().includes(this.editor.contentDOM)) return false;
+    // Keep Enter/newline handling and IME composition inside the editor, too.
+    return event.isComposing || this.editor.composing
+      || (event.key === "Enter" && !event.ctrlKey && !event.metaKey && !event.altKey)
+      || this.matchesSendShortcut(event);
+  }
+
+  private matchesSendShortcut(event: KeyboardEvent): boolean {
+    const shiftKey = event.key === "Enter"
+      ? shouldUsePromptEnterShiftShortcut(event.shiftKey, this.explicitShiftKeyActive, this.mobilePromptEnterMedia)
+      : event.shiftKey;
+    return matchesComposerSend({ key: event.key, ctrlKey: event.ctrlKey, metaKey: event.metaKey, altKey: event.altKey, shiftKey, isComposing: event.isComposing, target: event.target }, composerSendShortcut(this.shortcuts, this.mobilePromptEnterMedia));
+  }
+
   private handleEditorKeyDown(event: KeyboardEvent, view: EditorView): boolean {
     if (event.key === "Shift") {
       this.explicitShiftKeyActive = true;
       return false;
     }
-    if (event.key !== "Enter") {
-      this.explicitShiftKeyActive = false;
-      return false;
-    }
     if (event.defaultPrevented || event.isComposing || view.composing) return false;
-
-    const shiftKey = shouldUsePromptEnterShiftShortcut(event.shiftKey, this.explicitShiftKeyActive, this.mobilePromptEnterMedia);
+    const send = this.matchesSendShortcut(event);
+    const plainEnter = event.key === "Enter" && !event.ctrlKey && !event.metaKey && !event.altKey
+      && !shouldUsePromptEnterShiftShortcut(event.shiftKey, this.explicitShiftKeyActive, this.mobilePromptEnterMedia);
     this.explicitShiftKeyActive = false;
-    return this.handleEditorEnter(view, shiftKey);
+    if (plainEnter && this.completions.length) {
+      const completion = this.completions[this.selectedIndex];
+      if (completion !== undefined) this.pick(completion);
+      return true;
+    }
+    if (send) {
+      this.send(this.canSteer || this.isCompacting ? "followUp" : undefined);
+      return true;
+    }
+    if (event.key === "Enter" && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      return insertNewlineContinueMarkup(view) || insertNewlineAndIndent(view);
+    }
+    return false;
   }
 
   private handleEditorKeyUp(event: KeyboardEvent): boolean {
@@ -436,19 +536,6 @@ export class PromptEditor extends LitElement {
   private resetEditorModifierState(): boolean {
     this.explicitShiftKeyActive = false;
     return false;
-  }
-
-  private handleEditorEnter(view: EditorView, shiftKey: boolean): boolean {
-    if (!shiftKey && this.completions.length) {
-      const completion = this.completions[this.selectedIndex];
-      if (completion !== undefined) this.pick(completion);
-      return true;
-    }
-    if (!shouldSendPromptOnEnterShortcut(shiftKey, this.mobilePromptEnterMedia, readPromptEnterPreference())) {
-      return insertNewlineContinueMarkup(view) || insertNewlineAndIndent(view);
-    }
-    this.send(this.canSteer || this.isCompacting ? "followUp" : undefined);
-    return true;
   }
 
   private handleEditorTab(view: EditorView): boolean {
@@ -545,6 +632,14 @@ function emptyFileSuggestions(): FileSuggestion[] {
   return [];
 }
 
+function fileCompletionCacheKey(machineId: string, projectId: string, workspaceId: string, scope: string | undefined, query: string): string {
+  return JSON.stringify([machineId, projectId, workspaceId, scope ?? "tracked", query]);
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
 function emptySessionModels(): SessionModel[] {
   return [];
 }
@@ -612,4 +707,3 @@ function inputAssistanceContentAttributes(draftBeforeCursor: string): Record<str
   // CodeMirror is optimized for code and disables these by default, but the chat prompt is usually prose.
   return inputModeForDraft(draftBeforeCursor).kind === "normal" ? proseInputAssistanceAttributes : codeLikeInputAssistanceAttributes;
 }
-
