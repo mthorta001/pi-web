@@ -42,6 +42,20 @@ The installer fails closed on unknown or unsupported Docker setups, such as remo
 
 The Docker bootstrap does not require Node.js or npm on the host. It only needs a supported Docker/Compose setup plus `curl` or `wget`; Node and PI WEB are installed inside the local Docker image.
 
+### Podman status
+
+Podman Desktop is supported for host-side PI WEB deployment. The installer and
+`pi-web-docker` command select Podman automatically when Docker is unavailable,
+or explicitly with `PI_WEB_CONTAINER_ENGINE=podman`. Host lifecycle commands use
+`podman-compose` (or `podman compose`), and development builds use one direct
+`podman build` before starting the Compose services so the same image is not
+built concurrently for `data-init`, `sessiond`, and `web`.
+
+On macOS, Podman Desktop's API socket is a host proxy for the Linux VM and cannot
+be bind-mounted into a VM-managed container. The Podman profile therefore keeps
+`HOSTEXEC_MODE=disabled` and runs lifecycle operations from the host. Docker
+Engine and Docker Desktop keep their existing socket and hostexec behavior.
+
 Install with the bootstrap one-liner:
 
 ```bash
@@ -381,6 +395,14 @@ Pi session files are therefore shared at:
 ```text
 $HOME/.local/share/pi-web-docker/data/pi-agent/sessions/
 ```
+
+To reuse an existing native Pi installation instead of copying its state, set
+`PI_WEB_DOCKER_AGENT_DIR` in `.pi-web/docker-compose-dev.local.env` to the
+native agent directory, for example `$HOME/.pi/agent`. The directory is bind
+mounted at `/data/pi-agent`, so authentication, model catalogs, settings,
+trust, and sessions remain in one source of truth. Do not run native Pi and
+the containerized session daemon against the same live session at the same
+time.
 
 The [`container.env`](#container-environment) file for extra container environment variables is shared through the same directory:
 

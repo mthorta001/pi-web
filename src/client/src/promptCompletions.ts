@@ -1,4 +1,5 @@
 import type { SessionModel } from "../../shared/apiTypes";
+import { modelIsUnavailable, type ModelAvailabilityFilter } from "./modelAvailability";
 
 export type PromptCompletionTrigger =
   | { kind: "command"; query: string; from: number; to: number }
@@ -32,13 +33,14 @@ export interface ModelCompletionChoice {
 
 const MODEL_COMPLETION_LIMIT = 12;
 
-export function modelCompletionChoices(models: readonly SessionModel[], query: string): ModelCompletionChoice[] {
+export function modelCompletionChoices(models: readonly SessionModel[], query: string, availability?: ModelAvailabilityFilter): ModelCompletionChoice[] {
   const needle = query.toLowerCase();
   const choices: ModelCompletionChoice[] = [];
   for (const model of models) {
     // A completion must produce a strict provider/model-id reference, so models
     // missing either half of the identity can never be inserted.
     if (!hasQualifiedModelId(model)) continue;
+    if (modelIsUnavailable(model, availability)) continue;
     if (!modelMatchesQuery(model, needle)) continue;
     choices.push({
       insertText: `#${model.provider}/${model.id}`,

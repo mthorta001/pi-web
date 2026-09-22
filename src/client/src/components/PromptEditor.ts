@@ -10,6 +10,7 @@ import type { PromptAttachmentDelivery } from "../../../shared/apiTypes";
 import { capturePromptAttachments, effectivePromptAttachmentDelivery, isInlinePromptAttachment, promptAttachmentsCanUseInlineDelivery } from "../promptAttachmentCapture";
 import { inputModeForDraft, inputModesEqual, type InputMode } from "../inputModes";
 import { machineSessionKey } from "../machineKeys";
+import type { ModelAvailabilityFilter } from "../modelAvailability";
 import { detectPromptCompletionTrigger, fileCompletionInsertText, modelCompletionChoices, type PromptCompletionTrigger } from "../promptCompletions";
 import { promptArgumentHintExtension, setPromptArgumentHint } from "../promptArgumentHint";
 import { clearDraft, loadDraft, saveDraft } from "../promptDraftStorage";
@@ -41,6 +42,8 @@ export class PromptEditor extends LitElement {
   @property() machineId = "local";
   @property() projectId?: string;
   @property() workspaceId?: string;
+  /** Browser-local models hidden after a confirmed workspace policy rejection. */
+  @property({ attribute: false }) unavailableModelKeys: ReadonlySet<string> = new Set();
   /**
    * Workspace-effective folder for the "save to folder" attachment delivery.
    * Shown in the delivery label and sent explicitly with the save request, so
@@ -84,23 +87,30 @@ export class PromptEditor extends LitElement {
   private explicitShiftKeyActive = false;
 
   protected override willUpdate(changed: PropertyValues<this>) {
-    if (!changed.has("sessionId") && !changed.has("machineId")) return;
-    const previousSessionId = changed.has("sessionId") ? changed.get("sessionId") : this.sessionId;
-    const previousMachineId = changed.has("machineId") ? changed.get("machineId") : this.machineId;
-    const previousKey = draftStorageKey(previousMachineId, previousSessionId);
-    if (previousKey !== undefined) {
-      saveDraft(previousKey, this.draft);
-      saveStagedAttachments(previousKey, this.attachments);
+    if (changed.has("sessionId") || changed.has("machineId")) {
+      const previousSessionId = changed.has("sessionId") ? changed.get("sessionId") : this.sessionId;
+      const previousMachineId = changed.has("machineId") ? changed.get("machineId") : this.machineId;
+      const previousKey = draftStorageKey(previousMachineId, previousSessionId);
+      if (previousKey !== undefined) {
+        saveDraft(previousKey, this.draft);
+        saveStagedAttachments(previousKey, this.attachments);
+      }
+      const currentKey = draftStorageKey(this.machineId, this.sessionId);
+      this.draft = currentKey !== undefined ? loadDraft(currentKey) : "";
+      this.attachments = currentKey !== undefined ? loadStagedAttachments(currentKey) : [];
+      this.attachmentError = undefined;
+      this.currentInputMode = inputModeForDraft(this.draft);
+      this.completions = [];
+      this.selectedIndex = 0;
+      this.cancelCompletionRefresh();
+      this.requestVersion += 1;
     }
-    const currentKey = draftStorageKey(this.machineId, this.sessionId);
-    this.draft = currentKey !== undefined ? loadDraft(currentKey) : "";
-    this.attachments = currentKey !== undefined ? loadStagedAttachments(currentKey) : [];
-    this.attachmentError = undefined;
-    this.currentInputMode = inputModeForDraft(this.draft);
-    this.completions = [];
-    this.selectedIndex = 0;
-    this.cancelCompletionRefresh();
-    this.requestVersion += 1;
+    if (changed.has("unavailableModelKeys")) {
+      this.completions = [];
+      this.selectedIndex = 0;
+      this.requestVersion += 1;
+      void this.refreshCompletions();
+    }
   }
 
   protected override shouldUpdate(changed: PropertyValues<this>): boolean {
@@ -453,7 +463,8 @@ export class PromptEditor extends LitElement {
     } else if (trigger.kind === "model" && this.sessionId !== undefined && this.sessionId !== "" && this.cwd !== undefined && this.cwd !== "") {
       const models = await api.models({ id: this.sessionId, cwd: this.cwd }, this.machineId).then((response) => response.models).catch(emptySessionModels);
       if (version !== this.requestVersion) return;
-      this.completions = modelCompletionChoices(models, trigger.query).map((choice) => ({
+      const availability: ModelAvailabilityFilter = { machineId: this.machineId, unavailableModelKeys: this.unavailableModelKeys };
+      this.completions = modelCompletionChoices(models, trigger.query, availability).map((choice) => ({
         kind: "model",
         replaceFrom: trigger.from,
         replaceTo: trigger.to,

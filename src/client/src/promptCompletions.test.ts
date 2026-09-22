@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { SessionModel } from "../../shared/apiTypes";
+import { modelAvailabilityKey } from "./modelAvailability";
 import { detectPromptCompletionTrigger, fileCompletionInsertText, modelCompletionChoices } from "./promptCompletions";
 
 describe("detectPromptCompletionTrigger", () => {
@@ -121,6 +122,16 @@ describe("modelCompletionChoices", () => {
     expect(choices).toHaveLength(12);
     expect(choices[0]?.insertText).toBe("#p/m0");
     expect(choices[11]?.insertText).toBe("#p/m11");
+  });
+
+  it("hides models rejected by the current machine policy", () => {
+    const unavailableModelKeys = new Set([modelAvailabilityKey("local", { provider: "openai", id: "gpt-5.2" })]);
+
+    expect(modelCompletionChoices(models, "", { machineId: "local", unavailableModelKeys }).map((choice) => choice.insertText)).toEqual([
+      "#anthropic/claude-opus-4-5",
+      "#anthropic/claude-sonnet-4-5",
+      "#google/gemini-3-pro",
+    ]);
   });
 });
 

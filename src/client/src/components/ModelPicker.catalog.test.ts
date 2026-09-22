@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CommandOption, SessionModelCatalogEntry } from "../api";
+import { modelAvailabilityKey } from "../modelAvailability";
 import { filterModelOptions, modelCatalogEntryValue, modelCatalogToggleAllPlan, modelCatalogView } from "./ModelPicker";
 
 function entry(provider: string, id: string, enabled: boolean, name?: string, catalogIndex?: number): SessionModelCatalogEntry {
@@ -30,6 +31,16 @@ describe("filterModelOptions", () => {
     expect(filterModelOptions(options, "ANTHROPIC").map((option) => option.value)).toEqual(["anthropic/claude"]);
     expect(filterModelOptions(options, "openai/g").map((option) => option.value)).toEqual(["openai/gpt-5"]);
     expect(filterModelOptions(options, "gpt").map((option) => option.value)).toEqual(["openai/gpt-5"]);
+  });
+
+  it("hides policy-rejected models from the enabled list", () => {
+    const options: CommandOption[] = [
+      { value: "openai/gpt-5", label: "gpt-5", description: "openai" },
+      { value: "anthropic/claude", label: "claude", description: "anthropic" },
+    ];
+    const unavailableModelKeys = new Set([modelAvailabilityKey("local", { provider: "openai", id: "gpt-5" })]);
+
+    expect(filterModelOptions(options, "", { machineId: "local", unavailableModelKeys }).map((option) => option.value)).toEqual(["anthropic/claude"]);
   });
 });
 
@@ -88,5 +99,15 @@ describe("modelCatalogView", () => {
     ];
 
     expect(modelCatalogView(regrouped, "", stableOrder).rows.map(modelCatalogEntryValue)).toEqual(stableOrder);
+  });
+
+  it("hides policy-rejected models from the full catalog", () => {
+    const unavailableModelKeys = new Set([modelAvailabilityKey("local", { provider: "openai", id: "gpt-4o" })]);
+
+    expect(modelCatalogView(catalog, "", undefined, { machineId: "local", unavailableModelKeys }).rows.map(modelCatalogEntryValue)).toEqual([
+      "openai/gpt-5",
+      "anthropic/claude-sonnet-4-5",
+      "google/gemini-2.5-pro",
+    ]);
   });
 });
