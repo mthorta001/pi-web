@@ -42,6 +42,11 @@ x-pi-web-dev-data-volume: &pi-web-dev-data-volume
   source: ${PI_WEB_DOCKER_DATA_DIR:-${HOME}/.local/share/pi-web-docker/data}
   target: /data
 
+x-pi-web-dev-agent-volume: &pi-web-dev-agent-volume
+  type: bind
+  source: ${PI_WEB_DOCKER_AGENT_DIR:-${PI_WEB_DOCKER_DATA_DIR:-${HOME}/.local/share/pi-web-docker/data}/pi-agent}
+  target: /data/pi-agent
+
 x-pi-web-dev-volumes: &pi-web-dev-volumes
   - type: bind
     source: ..
@@ -50,6 +55,7 @@ x-pi-web-dev-volumes: &pi-web-dev-volumes
     source: node_modules
     target: /workspace/node_modules
   - *pi-web-dev-data-volume
+  - *pi-web-dev-agent-volume
 
 services:
   data-init:

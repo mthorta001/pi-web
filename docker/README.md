@@ -396,6 +396,14 @@ Pi session files are therefore shared at:
 $HOME/.local/share/pi-web-docker/data/pi-agent/sessions/
 ```
 
+To reuse an existing native Pi installation instead of copying its state, set
+`PI_WEB_DOCKER_AGENT_DIR` in `.pi-web/docker-compose-dev.local.env` to the
+native agent directory, for example `$HOME/.pi/agent`. The directory is bind
+mounted at `/data/pi-agent`, so authentication, model catalogs, settings,
+trust, and sessions remain in one source of truth. Do not run native Pi and
+the containerized session daemon against the same live session at the same
+time.
+
 The [`container.env`](#container-environment) file for extra container environment variables is shared through the same directory:
 
 ```text

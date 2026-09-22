@@ -119,6 +119,7 @@ write_initial_dev_config() {
 # Shared Docker/runtime-style defaults may also be set here:
 # PI_WEB_CONTAINER_ENGINE=podman
 # PI_WEB_DOCKER_DATA_DIR=/absolute/path/to/pi-web-docker/data
+# PI_WEB_DOCKER_AGENT_DIR=/absolute/path/to/.pi/agent
 # PI_WEB_DOCKER_EXTRA_HOST_PATHS="/absolute/path/one /absolute/path/two"
 #
 # PI_WEB_UID and PI_WEB_GID default to the current host user so
@@ -239,6 +240,8 @@ pi_web_gid=$(value_from_config_or_generated_or_env_or_default PI_WEB_GID "$host_
 docker_gid=$(value_from_config_or_generated_or_env_or_runtime_or_default DOCKER_GID "$(pi_web_docker_host_detect_docker_gid)")
 default_data_dir=${HOME:-$repo_root/.pi-web}/.local/share/pi-web-docker/data
 pi_web_data_dir=$(value_from_config_or_generated_or_env_or_runtime_or_default PI_WEB_DOCKER_DATA_DIR "$default_data_dir")
+default_agent_dir=${HOME:-$repo_root}/.pi/agent
+pi_web_agent_dir=$(value_from_config_or_generated_or_env_or_runtime_or_default PI_WEB_DOCKER_AGENT_DIR "$default_agent_dir")
 pi_web_extra_host_paths=$(value_from_config_or_generated_or_env_or_runtime_or_default PI_WEB_DOCKER_EXTRA_HOST_PATHS "")
 pi_web_opensuse_image=$(value_from_config_or_generated_or_env_or_runtime_or_default PI_WEB_OPENSUSE_IMAGE opensuse/tumbleweed)
 pi_web_nodejs_major=$(value_from_config_or_generated_or_env_or_runtime_or_default PI_WEB_NODEJS_MAJOR 22)
@@ -263,6 +266,10 @@ enforce_non_root_dev_uid "$pi_web_uid"
 case "$pi_web_data_dir" in
   /*) ;;
   *) die "PI_WEB_DOCKER_DATA_DIR must be an absolute path, got: $pi_web_data_dir" ;;
+esac
+case "$pi_web_agent_dir" in
+  /*) ;;
+  *) die "PI_WEB_DOCKER_AGENT_DIR must be an absolute path, got: $pi_web_agent_dir" ;;
 esac
 [ -n "$compose_project_name" ] || die "COMPOSE_PROJECT_NAME must not be empty"
 
@@ -289,6 +296,7 @@ PI_WEB_GID=$pi_web_gid
 DOCKER_GID=$docker_gid
 PI_WEB_CONTAINER_ENGINE=$PI_WEB_DETECTED_CONTAINER_ENGINE
 PI_WEB_DOCKER_DATA_DIR=$pi_web_data_dir
+PI_WEB_DOCKER_AGENT_DIR=$pi_web_agent_dir
 PI_WEB_DOCKER_DEV_REPO_ROOT=$repo_root
 PI_WEB_DOCKER_HOST_PROFILE=$PI_WEB_DETECTED_DOCKER_HOST_PROFILE
 PI_WEB_DOCKER_SOCKET_SOURCE=$PI_WEB_DETECTED_DOCKER_SOCKET_SOURCE
