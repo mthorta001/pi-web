@@ -44,7 +44,17 @@ The Docker bootstrap does not require Node.js or npm on the host. It only needs 
 
 ### Podman status
 
-Podman Desktop can run Linux containers and the Compose files parse with `podman-compose`. The current installer and `pi-web-docker` command still target Docker Engine or Docker Desktop, however: host detection intentionally rejects alternate container runtimes, rootless sockets, and non-Docker socket paths. Therefore Podman is viable as a container runtime, but this repository does not yet provide a verified pi-web Podman deployment or Podman-aware lifecycle commands. Full support would require a separate runtime abstraction for the CLI, socket mounts, host-profile detection, and `hostexec` behavior.
+Podman Desktop is supported for host-side PI WEB deployment. The installer and
+`pi-web-docker` command select Podman automatically when Docker is unavailable,
+or explicitly with `PI_WEB_CONTAINER_ENGINE=podman`. Host lifecycle commands use
+`podman-compose` (or `podman compose`), and development builds use one direct
+`podman build` before starting the Compose services so the same image is not
+built concurrently for `data-init`, `sessiond`, and `web`.
+
+On macOS, Podman Desktop's API socket is a host proxy for the Linux VM and cannot
+be bind-mounted into a VM-managed container. The Podman profile therefore keeps
+`HOSTEXEC_MODE=disabled` and runs lifecycle operations from the host. Docker
+Engine and Docker Desktop keep their existing socket and hostexec behavior.
 
 Install with the bootstrap one-liner:
 

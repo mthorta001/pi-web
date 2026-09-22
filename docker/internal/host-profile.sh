@@ -51,7 +51,7 @@ pi_web_docker_host_socket_source_for_endpoint() {
 
 pi_web_docker_host_detect_docker_gid() {
   case "${PI_WEB_DETECTED_DOCKER_HOST_PROFILE:-}" in
-    mac-docker-desktop)
+    mac-docker-desktop|mac-podman-desktop|linux-native-podman)
       printf '0\n'
       return 0
       ;;
@@ -119,6 +119,11 @@ pi_web_docker_host_resolve_profile() {
 
   if pi_web_docker_host_in_container && [ -n "$pi_web_persisted_profile" ]; then
     PI_WEB_DETECTED_DOCKER_HOST_PROFILE=$pi_web_persisted_profile
+    case "$pi_web_persisted_profile" in
+      linux-native-docker|mac-docker-desktop) PI_WEB_DETECTED_CONTAINER_ENGINE=docker ;;
+      linux-native-podman|mac-podman-desktop) PI_WEB_DETECTED_CONTAINER_ENGINE=podman ;;
+      *) PI_WEB_DETECTED_CONTAINER_ENGINE=${PI_WEB_CONTAINER_ENGINE:-docker} ;;
+    esac
     if [ -n "$pi_web_persisted_hostexec" ]; then
       PI_WEB_DETECTED_HOSTEXEC_MODE=$pi_web_persisted_hostexec
     else
@@ -127,7 +132,10 @@ pi_web_docker_host_resolve_profile() {
         *) PI_WEB_DETECTED_HOSTEXEC_MODE=disabled ;;
       esac
     fi
-    PI_WEB_DETECTED_DOCKER_SOCKET_SOURCE=${pi_web_persisted_socket:-/var/run/docker.sock}
+    PI_WEB_DETECTED_DOCKER_SOCKET_SOURCE=$pi_web_persisted_socket
+    case "$PI_WEB_DETECTED_CONTAINER_ENGINE" in
+      docker) PI_WEB_DETECTED_DOCKER_SOCKET_SOURCE=${PI_WEB_DETECTED_DOCKER_SOCKET_SOURCE:-/var/run/docker.sock} ;;
+    esac
     PI_WEB_DOCKER_HOST_PROFILE_REUSED=1
     return 0
   fi
@@ -145,8 +153,35 @@ pi_web_docker_host_detect_profile() {
   PI_WEB_DETECTED_DOCKER_SOCKET_SOURCE=
   PI_WEB_DETECTED_DOCKER_OS=
   PI_WEB_DETECTED_DOCKER_HOST_PROFILE=
+  PI_WEB_DETECTED_CONTAINER_ENGINE=
   PI_WEB_DETECTED_HOSTEXEC_MODE=disabled
   PI_WEB_DOCKER_HOST_PROFILE_ERROR=
+
+  requested_container_engine=${PI_WEB_CONTAINER_ENGINE:-auto}
+  case "$requested_container_engine" in
+    auto)
+      if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        requested_container_engine=docker
+      elif command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
+        requested_container_engine=podman
+      else
+        PI_WEB_DOCKER_HOST_PROFILE_ERROR="neither a reachable Docker daemon nor a reachable Podman machine was found"
+        return 1
+      fi
+      ;;
+    docker|podman) ;;
+    *)
+      PI_WEB_DOCKER_HOST_PROFILE_ERROR="unsupported PI_WEB_CONTAINER_ENGINE: $requested_container_engine (expected auto, docker, or podman)"
+      return 1
+      ;;
+  esac
+
+  if [ "$requested_container_engine" = podman ]; then
+    pi_web_docker_host_detect_podman_profile
+    return $?
+  fi
+
+  PI_WEB_DETECTED_CONTAINER_ENGINE=docker
 
   if ! command -v docker >/dev/null 2>&1; then
     PI_WEB_DOCKER_HOST_PROFILE_ERROR="docker CLI is required"
@@ -245,6 +280,50 @@ pi_web_docker_host_detect_profile() {
           return 1
           ;;
       esac
+      ;;
+  esac
+
+  return 0
+}
+
+pi_web_docker_host_detect_podman_profile() {
+  PI_WEB_DETECTED_CONTAINER_ENGINE=podman
+  PI_WEB_DETECTED_DOCKER_CONTEXT=$(podman system connection default 2>/dev/null || printf 'podman')
+  PI_WEB_DETECTED_DOCKER_ENDPOINT=
+  PI_WEB_DETECTED_DOCKER_HOST_ENV=${DOCKER_HOST:-}
+  PI_WEB_DETECTED_DOCKER_EFFECTIVE_ENDPOINT=
+  PI_WEB_DETECTED_DOCKER_SOCKET_SOURCE=
+  PI_WEB_DETECTED_DOCKER_OS=$(podman info --format '{{.Host.OS}}' 2>/dev/null || printf '')
+
+  if ! command -v podman >/dev/null 2>&1 || ! podman info >/dev/null 2>&1; then
+    PI_WEB_DOCKER_HOST_PROFILE_ERROR="Podman machine is not reachable by this user"
+    return 1
+  fi
+
+  case "$PI_WEB_DETECTED_HOST_OS" in
+    Darwin)
+      podman_socket=$(podman machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}' 2>/dev/null || printf '')
+      if [ -z "$podman_socket" ] || [ ! -S "$podman_socket" ]; then
+        PI_WEB_DOCKER_HOST_PROFILE_ERROR="Podman Desktop API socket is not accessible at ${podman_socket:-unknown}"
+        return 1
+      fi
+      PI_WEB_DETECTED_DOCKER_HOST_PROFILE=mac-podman-desktop
+      # The socket is a macOS proxy for the Podman VM and cannot be bind-mounted
+      # into a VM-managed container. Host-side lifecycle commands use podman;
+      # the web container does not receive a control socket.
+      PI_WEB_DETECTED_DOCKER_SOCKET_SOURCE=
+      PI_WEB_DETECTED_HOSTEXEC_MODE=disabled
+      ;;
+    Linux)
+      PI_WEB_DETECTED_DOCKER_HOST_PROFILE=linux-native-podman
+      PI_WEB_DETECTED_HOSTEXEC_MODE=disabled
+      if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "$XDG_RUNTIME_DIR/podman/podman.sock" ]; then
+        PI_WEB_DETECTED_DOCKER_SOCKET_SOURCE=$XDG_RUNTIME_DIR/podman/podman.sock
+      fi
+      ;;
+    *)
+      PI_WEB_DOCKER_HOST_PROFILE_ERROR="unsupported host OS for Podman: $PI_WEB_DETECTED_HOST_OS"
+      return 1
       ;;
   esac
 
@@ -355,7 +434,7 @@ pi_web_docker_host_write_compose_override() {
 
   case "$host_profile" in
     linux-native-docker) hostexec_mode=nsenter ;;
-    mac-docker-desktop) hostexec_mode=disabled ;;
+    mac-docker-desktop|mac-podman-desktop|linux-native-podman) hostexec_mode=disabled ;;
     *)
       printf '%s\n' "unsupported PI WEB Docker host profile: $host_profile" >&2
       return 1
@@ -369,8 +448,12 @@ pi_web_docker_host_write_compose_override() {
 x-pi-web-host-volumes: &pi-web-host-volumes
 EOF
 
-  socket_source=${PI_WEB_DETECTED_DOCKER_SOCKET_SOURCE:-/var/run/docker.sock}
-  pi_web_docker_host_write_volume "$socket_source" /var/run/docker.sock false
+  case "$host_profile" in
+    linux-native-docker|mac-docker-desktop)
+      socket_source=${PI_WEB_DETECTED_DOCKER_SOCKET_SOURCE:-/var/run/docker.sock}
+      pi_web_docker_host_write_volume "$socket_source" /var/run/docker.sock false
+      ;;
+  esac
 
   case "$host_profile" in
     linux-native-docker)
@@ -383,6 +466,17 @@ EOF
       pi_web_docker_host_write_existing_volume /Users /Users false
       pi_web_docker_host_write_existing_volume /Volumes /Volumes false
       pi_web_docker_host_write_existing_volume /private /private false
+      ;;
+    mac-podman-desktop)
+      # Podman Desktop's Linux VM does not expose macOS volume roots such as
+      # /Volumes through the default file-sharing setup. The repository is
+      # already under /Users, which is the only host tree needed by dev mode.
+      pi_web_docker_host_write_existing_volume /Users /Users false
+      ;;
+    linux-native-podman)
+      pi_web_docker_host_write_existing_volume /home /home false
+      pi_web_docker_host_write_existing_volume /srv /srv false
+      pi_web_docker_host_write_existing_volume /opt /opt false
       ;;
   esac
 
@@ -403,6 +497,20 @@ EOF
   cat >>"$PI_WEB_DOCKER_HOST_OVERRIDE_TEMP" <<EOF
 
 services:
+EOF
+
+  if [ "$host_profile" = mac-podman-desktop ]; then
+    # The checkout may contain a node_modules symlink into another /Users tree.
+    # Make that target visible to data-init before Podman mounts the dependency
+    # volume at /workspace/node_modules.
+    cat >>"$PI_WEB_DOCKER_HOST_OVERRIDE_TEMP" <<EOF
+  data-init:
+    volumes: *pi-web-host-volumes
+
+EOF
+  fi
+
+  cat >>"$PI_WEB_DOCKER_HOST_OVERRIDE_TEMP" <<EOF
   sessiond:
     environment:
       HOSTEXEC_MODE: $hostexec_mode
@@ -428,10 +536,12 @@ pi_web_docker_host_print_detection_failure() {
   printf '  effective endpoint: %s\n' "${PI_WEB_DETECTED_DOCKER_EFFECTIVE_ENDPOINT:-unknown}" >&2
   printf '  docker socket source: %s\n' "${PI_WEB_DETECTED_DOCKER_SOCKET_SOURCE:-unknown}" >&2
   printf '  docker OS: %s\n' "${PI_WEB_DETECTED_DOCKER_OS:-unknown}" >&2
+  printf '  container engine: %s\n' "${PI_WEB_DETECTED_CONTAINER_ENGINE:-unknown}" >&2
   printf '%s\n' "" >&2
   printf '%s\n' "Supported profiles:" >&2
   printf '%s\n' "  - native Linux Docker Engine using /var/run/docker.sock" >&2
   printf '%s\n' "  - Docker Desktop for Mac" >&2
+  printf '%s\n' "  - Podman Desktop for Mac" >&2
   if [ -n "${PI_WEB_DOCKER_HOST_PROFILE_ERROR:-}" ]; then
     printf '%s\n' "" >&2
     printf 'Reason: %s\n' "$PI_WEB_DOCKER_HOST_PROFILE_ERROR" >&2
@@ -439,12 +549,31 @@ pi_web_docker_host_print_detection_failure() {
 }
 
 pi_web_docker_compose() {
-  if docker compose version >/dev/null 2>&1; then
-    docker compose "$@"
-  elif command -v docker-compose >/dev/null 2>&1; then
-    docker-compose "$@"
-  else
-    printf '%s\n' "Docker Compose is required (docker compose plugin or docker-compose)" >&2
-    return 1
-  fi
+  container_engine=${PI_WEB_DETECTED_CONTAINER_ENGINE:-${PI_WEB_CONTAINER_ENGINE:-auto}}
+  case "$container_engine" in
+    podman)
+      if command -v podman-compose >/dev/null 2>&1 && podman-compose version >/dev/null 2>&1; then
+        podman-compose "$@"
+      elif podman compose version >/dev/null 2>&1; then
+        podman compose "$@"
+      else
+        printf '%s\n' "Podman Compose is required (podman-compose or podman compose)" >&2
+        return 1
+      fi
+      ;;
+    docker|auto)
+      if docker compose version >/dev/null 2>&1; then
+        docker compose "$@"
+      elif command -v docker-compose >/dev/null 2>&1; then
+        docker-compose "$@"
+      else
+        printf '%s\n' "Docker Compose is required (docker compose plugin or docker-compose)" >&2
+        return 1
+      fi
+      ;;
+    *)
+      printf '%s\n' "unsupported container engine: $container_engine" >&2
+      return 1
+      ;;
+  esac
 }

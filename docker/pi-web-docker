@@ -19,22 +19,22 @@ explicitly with --dev.
 
 Commands:
   install                 Run the production one-line/bootstrap installer
-  start                   Start the PI WEB Docker stack
-  stop                    Stop the PI WEB Docker stack without deleting data
+  start                   Start the PI WEB container stack
+  stop                    Stop the PI WEB container stack without deleting data
   restart                 Restart web and sessiond
   restart-web             Restart only the web service
   restart-sessiond        Restart only the session daemon
-  update                  Update and recreate the Docker stack
+  update                  Update and recreate the container stack
                           (development mode fast-forwards the checkout first
                           and requires it to be clean)
-  status                  Show Docker Compose service status
+  status                  Show Compose service status
   logs [web|sessiond|data-init]
-                          Follow Docker Compose logs
+                          Follow Compose logs
   shell [web|sessiond]    Open a shell in a service container
   doctor                  Print static Docker command diagnostics
   cli <pi-web args...>    Run the pi-web CLI in the web container
 
-Update and restart commands launched inside a PI WEB Docker container start an
+Update and restart commands launched inside a PI WEB container start an
 independent helper container first, then stream the helper logs inline. The
 helper continues running if the terminal or web/sessiond exits.
 EOF
@@ -126,6 +126,46 @@ docker_mode() {
     runtime|dev) printf '%s\n' "$PI_WEB_DOCKER_SELECTED_MODE" ;;
     *) die "unsupported Docker mode: $PI_WEB_DOCKER_SELECTED_MODE" ;;
   esac
+}
+
+container_engine_name() {
+  requested_engine=${PI_WEB_CONTAINER_ENGINE:-auto}
+  if is_truthy "${PI_WEB_DOCKER_RUNTIME:-}"; then
+    # The runtime image contains Docker CLI. When the host engine is Podman,
+    # it talks to the mounted Docker-compatible API socket when one is
+    # available; host-side lifecycle commands use podman directly.
+    requested_engine=docker
+  fi
+  case "$requested_engine" in
+    docker)
+      printf '%s\n' docker
+      ;;
+    podman)
+      printf '%s\n' podman
+      ;;
+    auto)
+      if command -v docker >/dev/null 2>&1; then
+        printf '%s\n' docker
+      elif command -v podman >/dev/null 2>&1; then
+        printf '%s\n' podman
+      else
+        die "Docker or Podman CLI is required"
+      fi
+      ;;
+    *)
+      die "unsupported PI_WEB_CONTAINER_ENGINE: $requested_engine"
+      ;;
+  esac
+}
+
+container_cli() {
+  container_engine=$(container_engine_name)
+  "$container_engine" "$@"
+}
+
+require_container_engine() {
+  container_engine=$(container_engine_name)
+  command -v "$container_engine" >/dev/null 2>&1 || die "$container_engine CLI is required"
 }
 
 mode_flag() {
@@ -300,14 +340,28 @@ enforce_container_mode_match() {
   [ "$runtime_mode" = "$selected_mode" ] || die "this PI WEB Docker container is in $runtime_mode mode; rerun pi-web-docker with the matching mode flag"
 }
 
-docker_compose() {
-  if docker compose version >/dev/null 2>&1; then
-    docker compose "$@"
-  elif command -v docker-compose >/dev/null 2>&1; then
-    docker-compose "$@"
-  else
-    die "Docker Compose is required (docker compose plugin or docker-compose)"
-  fi
+container_compose() {
+  container_engine=$(container_engine_name)
+  case "$container_engine" in
+    podman)
+      if command -v podman-compose >/dev/null 2>&1 && podman-compose version >/dev/null 2>&1; then
+        podman-compose "$@"
+      elif podman compose version >/dev/null 2>&1; then
+        podman compose "$@"
+      else
+        die "Podman Compose is required (podman-compose or podman compose)"
+      fi
+      ;;
+    docker)
+      if docker compose version >/dev/null 2>&1; then
+        docker compose "$@"
+      elif command -v docker-compose >/dev/null 2>&1; then
+        docker-compose "$@"
+      else
+        die "Docker Compose is required (docker compose plugin or docker-compose)"
+      fi
+      ;;
+  esac
 }
 
 is_checkout_runtime_default_root() {
@@ -397,7 +451,7 @@ runtime_compose() {
   project_name=$(required_env_file_value "$root/.env" COMPOSE_PROJECT_NAME)
   (
     cd "$root" || exit 1
-    docker_compose --project-name "$project_name" --env-file .env -f compose.yml -f compose.override.yml "$@"
+    container_compose --project-name "$project_name" --env-file .env -f compose.yml -f compose.override.yml "$@"
   )
 }
 
@@ -409,6 +463,108 @@ dev_compose() {
     cd "$root" || exit 1
     PI_WEB_DOCKER_ALLOW_ROOT=$PI_WEB_DOCKER_ALLOW_ROOT "$wrapper" "$@"
   )
+}
+
+dev_podman_build() {
+  pull_policy=${1:-missing}
+  root=$(dev_root)
+  generated_env=$root/.pi-web/docker-compose-dev.generated.env
+  [ -f "$generated_env" ] || die "generated Podman dev env not found at $generated_env; run pi-web-docker --dev status first"
+
+  image=$(env_file_value "$generated_env" PI_WEB_DEV_IMAGE 2>/dev/null || true)
+  [ -n "$image" ] || image=pi-web:dev
+  opensuse_image=$(env_file_value "$generated_env" PI_WEB_OPENSUSE_IMAGE 2>/dev/null || true)
+  nodejs_major=$(env_file_value "$generated_env" PI_WEB_NODEJS_MAJOR 2>/dev/null || true)
+  nodejs_repo=$(env_file_value "$generated_env" PI_WEB_NODEJS_REPO 2>/dev/null || true)
+  npm_registry=$(env_file_value "$generated_env" PI_WEB_NPM_REGISTRY 2>/dev/null || true)
+  extra_zypper_packages=$(env_file_value "$generated_env" PI_WEB_EXTRA_ZYPPER_PACKAGES 2>/dev/null || true)
+  pi_web_uid=$(env_file_value "$generated_env" PI_WEB_UID 2>/dev/null || true)
+  pi_web_gid=$(env_file_value "$generated_env" PI_WEB_GID 2>/dev/null || true)
+
+  set -- build --pull="$pull_policy" --file "$root/docker/Dockerfile.dev" --tag "$image"
+  set -- "$@" --build-arg "OPENSUSE_IMAGE=${opensuse_image:-opensuse/tumbleweed}"
+  set -- "$@" --build-arg "NODEJS_MAJOR=${nodejs_major:-22}"
+  set -- "$@" --build-arg "NODEJS_REPO=${nodejs_repo:-auto}"
+  set -- "$@" --build-arg "PI_WEB_NPM_REGISTRY=$npm_registry"
+  set -- "$@" --build-arg "PI_WEB_EXTRA_ZYPPER_PACKAGES=$extra_zypper_packages"
+  set -- "$@" --build-arg "PI_WEB_UID=${pi_web_uid:-1000}"
+  set -- "$@" --build-arg "PI_WEB_GID=${pi_web_gid:-1000}"
+  set -- "$@" "$root"
+  container_cli "$@"
+}
+
+dev_podman_prepare_node_modules_mount() {
+  root=$(dev_root)
+  node_modules=$root/node_modules
+  dev_podman_node_modules_backup=
+
+  if [ -L "$node_modules" ]; then
+    backup=$root/.pi-web/node_modules.podman-symlink.$$
+    [ ! -e "$backup" ] || die "Podman node_modules backup already exists at $backup"
+    mv "$node_modules" "$backup" || die "could not temporarily move the node_modules symlink to $backup"
+    if ! mkdir "$node_modules"; then
+      mv "$backup" "$node_modules" || true
+      die "could not create a temporary node_modules mount point at $node_modules"
+    fi
+    dev_podman_node_modules_backup=$backup
+  fi
+}
+
+dev_podman_restore_node_modules_mount() {
+  backup=${dev_podman_node_modules_backup:-}
+  [ -n "$backup" ] || return 0
+  root=$(dev_root)
+  node_modules=$root/node_modules
+
+  if ! rmdir "$node_modules" 2>/dev/null; then
+    leftover=$root/.pi-web/node_modules.podman-leftover.$$
+    mv "$node_modules" "$leftover" || {
+      printf '%s\n' "Warning: could not restore the node_modules symlink; backup remains at $backup" >&2
+      return 1
+    }
+  fi
+  mv "$backup" "$node_modules" || {
+    printf '%s\n' "Warning: could not restore the node_modules symlink from $backup" >&2
+    return 1
+  }
+  dev_podman_node_modules_backup=
+}
+
+dev_podman_wait_for_services() {
+  generated_env=$1
+  project_name=$(env_file_value "$generated_env" COMPOSE_PROJECT_NAME 2>/dev/null || true)
+  [ -n "$project_name" ] || project_name=pi-web-dev
+  web_container=${project_name}_web_1
+  sessiond_container=${project_name}_sessiond_1
+  attempts=0
+
+  while [ "$attempts" -lt 60 ]; do
+    web_running=$(container_cli inspect --format '{{.State.Running}}' "$web_container" 2>/dev/null || true)
+    sessiond_running=$(container_cli inspect --format '{{.State.Running}}' "$sessiond_container" 2>/dev/null || true)
+    web_health=$(container_cli inspect --format '{{.State.Health.Status}}' "$web_container" 2>/dev/null || true)
+    sessiond_health=$(container_cli inspect --format '{{.State.Health.Status}}' "$sessiond_container" 2>/dev/null || true)
+    if [ "$web_running" = true ] && [ "$sessiond_running" = true ] \
+      && [ "$web_health" = healthy ] && [ "$sessiond_health" = healthy ]; then
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 1
+  done
+
+  log "Timed out waiting for PI WEB Podman services before restoring node_modules symlink."
+  return 1
+}
+
+dev_podman_compose_up() {
+  dev_podman_prepare_node_modules_mount
+  dev_compose "$@"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    generated_env=$(dev_root)/.pi-web/docker-compose-dev.generated.env
+    dev_podman_wait_for_services "$generated_env" || status=$?
+  fi
+  dev_podman_restore_node_modules_mount || status=$?
+  return "$status"
 }
 
 compose_for_install() {
@@ -439,22 +595,29 @@ run_install() {
 
 run_start() {
   assert_no_args start "$@"
-  require_command docker
+  require_container_engine
   case "$(docker_mode)" in
     runtime) runtime_compose up -d ;;
-    dev) dev_compose up -d --build ;;
+    dev)
+      if [ "$(container_engine_name)" = podman ]; then
+        dev_podman_build missing
+        dev_podman_compose_up up -d
+      else
+        dev_compose up -d --build
+      fi
+      ;;
   esac
 }
 
 run_stop() {
   assert_no_args stop "$@"
-  require_command docker
+  require_container_engine
   compose_for_install down
 }
 
 run_status() {
   assert_no_args status "$@"
-  require_command docker
+  require_container_engine
   compose_for_install ps
 }
 
@@ -540,8 +703,16 @@ run_update() {
     dev)
       dev_update_fast_forward
       log "Rebuilding PI WEB development image ..."
-      dev_compose build --pull
+      if [ "$(container_engine_name)" = podman ]; then
+        dev_podman_build always
+      else
+        dev_compose build --pull
+      fi
       log "Recreating PI WEB development services ..."
+      if [ "$(container_engine_name)" = podman ]; then
+        dev_podman_compose_up up -d --force-recreate --remove-orphans
+        return $?
+      fi
       dev_compose up -d --force-recreate --remove-orphans
       ;;
   esac
@@ -561,7 +732,7 @@ validate_logs_target() {
 
 run_logs() {
   assert_at_most_one_arg logs "$@"
-  require_command docker
+  require_container_engine
   target=${1:-}
   validate_logs_target "$target"
   if [ -n "$target" ]; then
@@ -581,7 +752,7 @@ validate_shell_target() {
 
 run_shell() {
   assert_at_most_one_arg shell "$@"
-  require_command docker
+  require_container_engine
   target=$(validate_shell_target "${1:-web}")
   compose_for_install exec "$target" bash
 }
@@ -629,23 +800,34 @@ run_doctor() {
       fi
       ;;
   esac
-  if command -v docker >/dev/null 2>&1; then
-    docker --version || true
-    if docker compose version >/dev/null 2>&1; then
-      docker compose version || true
-    elif command -v docker-compose >/dev/null 2>&1; then
-      docker-compose --version || true
-    else
-      printf '%s\n' 'Docker Compose: not found'
-    fi
+  if container_engine=$(container_engine_name 2>/dev/null); then
+    "$container_engine" --version || true
+    case "$container_engine" in
+      podman)
+        if command -v podman-compose >/dev/null 2>&1; then
+          podman-compose version || true
+        else
+          podman compose version || true
+        fi
+        ;;
+      docker)
+        if docker compose version >/dev/null 2>&1; then
+          docker compose version || true
+        elif command -v docker-compose >/dev/null 2>&1; then
+          docker-compose --version || true
+        else
+          printf '%s\n' 'Compose: not found'
+        fi
+        ;;
+    esac
   else
-    printf '%s\n' 'Docker CLI: not found'
+    printf '%s\n' 'Container CLI: not found'
   fi
 }
 
 run_cli() {
   [ "$#" -gt 0 ] || die "cli requires pi-web arguments"
-  require_command docker
+  require_container_engine
   compose_for_install exec web pi-web "$@"
 }
 
@@ -657,7 +839,7 @@ current_container_ref() {
 
   hostname_value=$(hostname 2>/dev/null || true)
   [ -n "$hostname_value" ] || return 1
-  if docker container inspect "$hostname_value" >/dev/null 2>&1; then
+  if container_cli container inspect "$hostname_value" >/dev/null 2>&1; then
     printf '%s\n' "$hostname_value"
     return 0
   fi
@@ -688,7 +870,7 @@ helper_image() {
   fi
 
   container_ref=$(current_container_ref) || die "could not detect this Docker container; set PI_WEB_DOCKER_HELPER_IMAGE explicitly"
-  image=$(docker container inspect "$container_ref" --format '{{.Config.Image}}' 2>/dev/null || true)
+  image=$(container_cli container inspect "$container_ref" --format '{{.Config.Image}}' 2>/dev/null || true)
   [ -n "$image" ] && [ "$image" != "<no value>" ] || die "could not detect this container's image; set PI_WEB_DOCKER_HELPER_IMAGE explicitly"
   printf '%s\n' "$image"
 }
@@ -723,17 +905,17 @@ cleanup_old_helpers() {
   project_name=${2:-}
   base_filters="label=pi-web.docker-helper=true"
   if [ -n "$root" ] && [ -n "$project_name" ]; then
-    ids=$(docker ps -aq --filter "$base_filters" --filter "label=pi-web.docker-helper.root=$root" --filter "label=pi-web.docker-helper.project=$project_name" --filter status=exited 2>/dev/null || true)
+    ids=$(container_cli ps -aq --filter "$base_filters" --filter "label=pi-web.docker-helper.root=$root" --filter "label=pi-web.docker-helper.project=$project_name" --filter status=exited 2>/dev/null || true)
   elif [ -n "$root" ]; then
-    ids=$(docker ps -aq --filter "$base_filters" --filter "label=pi-web.docker-helper.root=$root" --filter status=exited 2>/dev/null || true)
+    ids=$(container_cli ps -aq --filter "$base_filters" --filter "label=pi-web.docker-helper.root=$root" --filter status=exited 2>/dev/null || true)
   else
-    ids=$(docker ps -aq --filter "$base_filters" --filter status=exited 2>/dev/null || true)
+    ids=$(container_cli ps -aq --filter "$base_filters" --filter status=exited 2>/dev/null || true)
   fi
-  old_ids=$(docker ps -aq --filter label=pi-web.docker-control=true --filter status=exited 2>/dev/null || true)
+  old_ids=$(container_cli ps -aq --filter label=pi-web.docker-control=true --filter status=exited 2>/dev/null || true)
   ids="$ids $old_ids"
   for id in $ids; do
     [ -n "$id" ] || continue
-    docker rm "$id" >/dev/null 2>&1 || true
+    container_cli rm "$id" >/dev/null 2>&1 || true
   done
 }
 
@@ -742,10 +924,10 @@ stream_detached_helper_logs() {
   printf '\n'
   printf 'Streaming detached PI WEB Docker helper logs inline.\n'
   printf 'If this terminal disconnects, the helper keeps running.\n'
-  printf 'Reconnect with: docker logs -f %s\n' "$helper_name"
+  printf 'Reconnect with: %s logs -f %s\n' "$(container_engine_name)" "$helper_name"
   printf '\n'
 
-  if docker logs -f "$helper_name"; then
+  if container_cli logs -f "$helper_name"; then
     logs_status=0
   else
     logs_status=$?
@@ -753,11 +935,11 @@ stream_detached_helper_logs() {
 
   if [ "$logs_status" -ne 0 ]; then
     log "pi-web-docker: detached helper log streaming stopped with status $logs_status"
-    log "pi-web-docker: reconnect with: docker logs -f $helper_name"
+    log "pi-web-docker: reconnect with: $(container_engine_name) logs -f $helper_name"
     return "$logs_status"
   fi
 
-  helper_status=$(docker inspect --format '{{.State.ExitCode}}' "$helper_name" 2>/dev/null || true)
+  helper_status=$(container_cli inspect --format '{{.State.ExitCode}}' "$helper_name" 2>/dev/null || true)
   if is_unsigned_int "$helper_status" && [ "$helper_status" -ne 0 ]; then
     log "pi-web-docker: detached helper exited with status $helper_status"
     return "$helper_status"
@@ -769,7 +951,7 @@ stream_detached_helper_logs() {
 start_detached_helper() {
   action=$1
   is_truthy "${PI_WEB_DOCKER_RUNTIME:-}" || die "detached helpers are only available inside the PI WEB Docker runtime"
-  require_command docker
+  require_container_engine
   selected_mode=$(docker_mode)
   root=$(control_root)
   env_file=$(control_env_file "$root")
@@ -794,7 +976,7 @@ start_detached_helper() {
 
   timestamp=$(date -u +%Y%m%d%H%M%S)
   helper_name=pi-web-docker-$action-$timestamp-$$
-  generated_env_keys="PI_WEB_UID PI_WEB_GID DOCKER_GID PI_WEB_DOCKER_HOST_PROFILE HOSTEXEC_MODE PI_WEB_DOCKER_EXTRA_HOST_PATHS PI_WEB_DOCKER_DATA_DIR PI_WEB_DOCKER_INSTALL_DIR PI_WEB_DOCKER_DEV_REPO_ROOT PI_WEB_DOCKER_REF PI_WEB_BIND_ADDR PI_WEB_PORT PI_WEB_DEV_API_BIND_ADDR PI_WEB_DEV_BIND_ADDR PI_WEB_DEV_API_PORT PI_WEB_DEV_PORT PI_WEB_DEV_SESSIOND_SOCKET PI_WEB_VERSION PI_WEB_OPENSUSE_IMAGE PI_WEB_NODEJS_MAJOR PI_WEB_NODEJS_REPO PI_WEB_EXTRA_ZYPPER_PACKAGES PI_WEB_IMAGE PI_WEB_DEV_IMAGE COMPOSE_PROJECT_NAME HOSTEXEC_IMAGE PI_WEB_MAX_UPLOAD_BYTES"
+  generated_env_keys="PI_WEB_UID PI_WEB_GID DOCKER_GID PI_WEB_DOCKER_HOST_PROFILE HOSTEXEC_MODE PI_WEB_DOCKER_EXTRA_HOST_PATHS PI_WEB_DOCKER_DATA_DIR PI_WEB_DOCKER_INSTALL_DIR PI_WEB_DOCKER_DEV_REPO_ROOT PI_WEB_DOCKER_REF PI_WEB_BIND_ADDR PI_WEB_PORT PI_WEB_DEV_API_BIND_ADDR PI_WEB_DEV_BIND_ADDR PI_WEB_DEV_API_PORT PI_WEB_DEV_PORT PI_WEB_DEV_SESSIOND_SOCKET PI_WEB_VERSION PI_WEB_OPENSUSE_IMAGE PI_WEB_NODEJS_MAJOR PI_WEB_NODEJS_REPO PI_WEB_NPM_REGISTRY PI_WEB_EXTRA_ZYPPER_PACKAGES PI_WEB_IMAGE PI_WEB_DEV_IMAGE COMPOSE_PROJECT_NAME HOSTEXEC_IMAGE PI_WEB_MAX_UPLOAD_BYTES"
 
   set -- run -d \
     --env-file "$env_file" \
@@ -840,7 +1022,7 @@ start_detached_helper() {
   fi
   set -- "$@" __run-detached "$action"
 
-  container_id=$(docker "$@") || die "could not start detached Docker helper"
+  container_id=$(container_cli "$@") || die "could not start detached container helper"
   printf 'Started detached PI WEB Docker helper: %s\n' "$helper_name"
   printf 'Container ID: %s\n' "$container_id"
   stream_detached_helper_logs "$helper_name"
@@ -850,7 +1032,7 @@ run_detached_action() {
   action=${1:-}
   [ "$#" -eq 1 ] || die "__run-detached requires exactly one action"
   is_truthy "${PI_WEB_DOCKER_RUNTIME:-}" || die "detached actions only run inside the PI WEB Docker runtime"
-  require_command docker
+  require_container_engine
   log "PI WEB Docker helper running action: $action"
   case "$action" in
     update) run_update ;;

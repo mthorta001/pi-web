@@ -38,7 +38,12 @@ COPY scripts/install-git-hooks.mjs scripts/install-git-hooks.mjs
 # Keep an immutable dependency seed outside /workspace, which is hidden by the
 # checkout bind mount at runtime. A cached generation is added after custom
 # image hooks so it identifies the final dependency tree.
-RUN npm ci \
+ARG PI_WEB_NPM_REGISTRY=""
+RUN if [ -n "$PI_WEB_NPM_REGISTRY" ]; then \
+    npm ci --registry="$PI_WEB_NPM_REGISTRY"; \
+  else \
+    npm ci; \
+  fi \
   && install -d -m 0755 /opt/pi-web-dev-dependencies \
   && cp package.json package-lock.json /opt/pi-web-dev-dependencies/ \
   && chmod -R a+rwX /workspace/node_modules \
@@ -48,6 +53,12 @@ RUN npm ci \
   && npm cache clean --force \
   && chmod -R a+rwX /data \
   && chmod 0777 /workspace
+
+# Podman Desktop cannot reliably overlay a named volume on a host checkout's
+# node_modules symlink. Keep the immutable image seed available to development
+# processes as a runtime fallback when that nested mount is unavailable.
+ENV PATH=/opt/pi-web-dev-dependencies/node_modules/.bin:/workspace/node_modules/.bin:$PATH \
+  NODE_PATH=/opt/pi-web-dev-dependencies/node_modules
 
 COPY --chmod=0755 docker/internal/dev/sync-node-modules /usr/local/sbin/pi-web-dev-sync-node-modules
 

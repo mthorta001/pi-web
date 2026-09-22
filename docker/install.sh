@@ -15,8 +15,8 @@ usage() {
   cat <<'EOF'
 Usage: docker/install.sh [options]
 
-Install or update the local-build PI WEB Docker runtime. The installer refreshes
-Docker assets in the install directory, writes host-specific .env values,
+Install or update the local-build PI WEB container runtime. The installer refreshes
+container assets in the install directory, writes host-specific .env values,
 rebuilds the image without using cache, and recreates the split sessiond/web
 services without deleting persistent data.
 
@@ -33,13 +33,13 @@ Options:
                           (default: auto)
   --extra-zypper-packages LIST
                           extra openSUSE packages to install during image build
-  --asset-dir DIR         Copy Docker assets from a local docker/ directory
-  --asset-ref REF         Fetch Docker assets from a Git ref (default: main)
+  --asset-dir DIR         Copy container assets from a local docker/ directory
+  --asset-ref REF         Fetch container assets from a Git ref (default: main)
   --skip-compose          Write assets/.env but skip build and service recreate
   -h, --help              Show this help
 
 Where it runs:
-  On the host, the installer detects the Docker host setup. Inside a PI WEB
+  On the host, the installer detects the container runtime setup. Inside a PI WEB
   container it reuses the host facts recorded in .env, because a container
   cannot observe its host: from inside a Linux container, a Docker Desktop for
   Mac host looks like native Linux Docker. Rerun the installer on the host
@@ -47,8 +47,9 @@ Where it runs:
   docker group.
 
 Progressive host setup:
-  The installer supports native Linux Docker Engine and Docker Desktop for Mac.
-  Unknown Docker hosts fail closed before services are recreated. Set
+  The installer supports native Linux Docker Engine, Docker Desktop for Mac,
+  and Podman Desktop for Mac. Unknown hosts fail closed before services are
+  recreated. Set
   PI_WEB_DOCKER_EXTRA_HOST_PATHS to a whitespace-separated list of additional
   existing absolute directories to bind-mount at the same path in the containers.
 
@@ -61,7 +62,7 @@ Container environment:
 Environment variables with the same names used in .env may also be set before
 running the installer, for example:
 
-  PI_WEB_VERSION=1.202606.4 docker/install.sh
+  PI_WEB_CONTAINER_ENGINE=podman PI_WEB_VERSION=1.202606.4 docker/install.sh
 EOF
 }
 
@@ -388,6 +389,7 @@ else
   docker_gid=$(value_from_env_or_default DOCKER_GID "$(pi_web_docker_host_detect_docker_gid)")
 fi
 pi_web_host_profile=$PI_WEB_DETECTED_DOCKER_HOST_PROFILE
+pi_web_container_engine=$PI_WEB_DETECTED_CONTAINER_ENGINE
 hostexec_mode=$PI_WEB_DETECTED_HOSTEXEC_MODE
 docker_socket_source=$PI_WEB_DETECTED_DOCKER_SOCKET_SOURCE
 
@@ -410,8 +412,11 @@ pi_web_extra_host_paths=$(value_from_env_or_existing_or_default PI_WEB_DOCKER_EX
 require_non_empty PI_WEB_UID "$pi_web_uid"
 require_non_empty PI_WEB_GID "$pi_web_gid"
 require_non_empty DOCKER_GID "$docker_gid"
+require_non_empty PI_WEB_CONTAINER_ENGINE "$pi_web_container_engine"
 require_non_empty PI_WEB_DOCKER_HOST_PROFILE "$pi_web_host_profile"
-require_non_empty PI_WEB_DOCKER_SOCKET_SOURCE "$docker_socket_source"
+if [ "$pi_web_container_engine" = docker ]; then
+  require_non_empty PI_WEB_DOCKER_SOCKET_SOURCE "$docker_socket_source"
+fi
 require_non_empty HOSTEXEC_MODE "$hostexec_mode"
 require_non_empty PI_WEB_DOCKER_DATA_DIR "$data_dir"
 require_non_empty PI_WEB_DOCKER_INSTALL_DIR "$install_dir"
@@ -451,7 +456,8 @@ PI_WEB_UID=$pi_web_uid
 PI_WEB_GID=$pi_web_gid
 DOCKER_GID=$docker_gid
 
-# Docker host facts, detected on the host and reused by in-container reruns.
+# Container host facts, detected on the host and reused by in-container reruns.
+PI_WEB_CONTAINER_ENGINE=$pi_web_container_engine
 PI_WEB_DOCKER_HOST_PROFILE=$pi_web_host_profile
 PI_WEB_DOCKER_SOCKET_SOURCE=$docker_socket_source
 HOSTEXEC_MODE=$hostexec_mode
@@ -481,61 +487,64 @@ PI_WEB_MAX_UPLOAD_BYTES=$pi_web_max_upload_bytes
 EOF
 mv "$temp_env" "$env_file"
 
-log "Wrote Docker assets to $install_dir"
+log "Wrote container assets to $install_dir"
 log "Wrote runtime environment to $env_file"
 log "Wrote host Compose override to $compose_override_file"
 if [ "${PI_WEB_DOCKER_HOST_PROFILE_REUSED:-0}" = 1 ]; then
-  log "Reused the recorded PI WEB Docker host profile: $pi_web_host_profile"
-  log "Rerun the installer on the Docker host to pick up host changes."
+  log "Reused the recorded PI WEB container host profile: $pi_web_host_profile"
+  log "Rerun the installer on the container host to pick up host changes."
 else
-  log "Selected PI WEB Docker host profile: $pi_web_host_profile"
+  log "Selected PI WEB container host profile: $pi_web_host_profile"
 fi
 case "$pi_web_host_profile" in
   linux-native-docker)
-    log "Enabled Linux host mounts and hostexec namespace bridge."
+    log "Selected Docker Engine with Linux host mounts and hostexec namespace bridge."
     ;;
   mac-docker-desktop)
-    log "Enabled Docker Desktop for Mac project mounts. hostexec is disabled because containers cannot enter native macOS namespaces."
+    log "Selected Docker Desktop for Mac. hostexec is disabled because containers cannot enter native macOS namespaces."
+    ;;
+  mac-podman-desktop)
+    log "Selected Podman Desktop for Mac. Lifecycle commands run on the host; hostexec is disabled."
     ;;
 esac
-log "Persistent PI WEB Docker data: $data_dir"
+log "Persistent PI WEB data: $data_dir"
 log "Container environment (safe to edit): $container_env_file"
 log "Custom image hooks: $custom_image_hooks_dir"
 
 if [ "${PI_WEB_DOCKER_SKIP_COMPOSE:-0}" = 1 ]; then
-  log "Skipping Docker build/recreate because PI_WEB_DOCKER_SKIP_COMPOSE=1"
+  log "Skipping container build/recreate because PI_WEB_DOCKER_SKIP_COMPOSE=1"
   exit 0
 fi
 
-if ! command -v docker >/dev/null 2>&1; then
-  die "docker CLI is required"
+if ! command -v "$pi_web_container_engine" >/dev/null 2>&1; then
+  die "$pi_web_container_engine CLI is required"
 fi
 
-if ! docker info >/dev/null 2>&1; then
-  die "docker daemon is not reachable by this user"
+if ! "$pi_web_container_engine" info >/dev/null 2>&1; then
+  die "$pi_web_container_engine runtime is not reachable by this user"
 fi
 
 cache_bust=${CACHE_BUST:-install-$(date -u +%Y%m%dT%H%M%SZ)}
 
 log ""
-log "WARNING: updating recreates the PI WEB Docker session daemon."
-log "Active Pi agent runtimes inside this Docker install can stop; update while sessions are idle."
-log "Persistent data under $data_dir is kept. The installer does not run 'docker compose down -v'."
+log "WARNING: updating recreates the PI WEB session daemon."
+log "Active Pi agent runtimes inside this container install can stop; update while sessions are idle."
+log "Persistent data under $data_dir is kept. The installer does not remove persistent volumes."
 log ""
-log "Building $pi_web_image with --pull --no-cache (CACHE_BUST=$cache_bust) ..."
+log "Building $pi_web_image with $pi_web_container_engine --pull --no-cache (CACHE_BUST=$cache_bust) ..."
 (
   cd "$install_dir"
   CACHE_BUST=$cache_bust run_runtime_compose build --pull --no-cache
 )
 
-log "Recreating split PI WEB Docker services ..."
+log "Recreating split PI WEB services ..."
 (
   cd "$install_dir"
   run_runtime_compose up -d --force-recreate --remove-orphans
 )
 
 log ""
-log "PI WEB Docker runtime is ready: http://$pi_web_bind_addr:$pi_web_port"
+log "PI WEB container runtime is ready: http://$pi_web_bind_addr:$pi_web_port"
 log "Install directory: $install_dir"
 log "To update later, run: $install_dir/pi-web-docker update"
 (

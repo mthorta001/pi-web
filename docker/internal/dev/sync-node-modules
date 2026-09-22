@@ -33,7 +33,13 @@ done
 
 [ -d "$seed_dir/node_modules" ] || die "development image is missing the dependency seed at $seed_dir/node_modules"
 [ -s "$generation_file" ] || die "development image is missing its dependency generation at $generation_file"
-[ ! -L "$target_dir" ] || die "refusing to synchronize through the node_modules symlink at $target_dir"
+if [ -L "$target_dir" ]; then
+  if [ "${PI_WEB_CONTAINER_ENGINE:-docker}" = podman ]; then
+    log "PI WEB Docker dev dependencies: using the immutable image seed because Podman cannot overlay the node_modules symlink at $target_dir."
+    exit 0
+  fi
+  die "refusing to synchronize through the node_modules symlink at $target_dir"
+fi
 mkdir -p "$target_dir"
 
 expected_generation=$(cat "$generation_file")
@@ -51,6 +57,8 @@ log "Synchronizing PI WEB Docker dev dependencies from the rebuilt image ..."
 # Write the marker only after a complete copy so a failed init retries next time.
 find "$target_dir" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 cp -a "$seed_dir/node_modules/." "$target_dir/"
+chown -R "${PI_WEB_UID:-0}:${PI_WEB_GID:-0}" "$target_dir"
+chmod -R a+rwX "$target_dir"
 printf '%s\n' "$expected_generation" >"$marker_file"
 chmod 0666 "$marker_file"
 log "PI WEB Docker dev dependencies synchronized."
