@@ -12,6 +12,7 @@ import { ChatTranscriptStore } from "../chatTranscriptStore";
 import { isHistoryTailSlice } from "../chatHistoryCache";
 import { isShellInput } from "../inputModes";
 import { fileCompletionInsertText } from "../promptCompletions";
+import { guardrailBlockedModelFromMessage, isGuardrailBlockedModelError, type ModelReference } from "../modelAvailability";
 import { SessionSocket, type GlobalSessionEvent, type SessionUiEvent } from "../sessionSocket";
 import { isArchivableSessionInfo, isTransientNewSessionInfo } from "../sessionPersistence";
 import { isSessionActive } from "../../../shared/activity";
@@ -65,6 +66,7 @@ export interface SessionControllerDependencies {
   replacePromptEditorText?: (replacement: PromptEditorTextReplacement) => void | Promise<void>;
   onSelectedSessionReady?: (selection: SelectedSessionReady) => void;
   onModelScopeChanged?: (revision: number) => void;
+  onModelUnavailable?: (observation: { machineId: string; model: ModelReference }) => void;
 }
 
 interface BulkSessionMutationResult {
@@ -132,6 +134,7 @@ export class SessionController {
   private readonly replacePromptEditorText: SessionControllerDependencies["replacePromptEditorText"];
   private readonly onSelectedSessionReady: SessionControllerDependencies["onSelectedSessionReady"];
   private readonly onModelScopeChanged: SessionControllerDependencies["onModelScopeChanged"];
+  private readonly onModelUnavailable: SessionControllerDependencies["onModelUnavailable"];
   private readonly captureNavigation: SessionControllerDependencies["captureNavigation"];
   private readonly beginNavigationOperation: SessionControllerDependencies["beginNavigationOperation"];
   private readonly browserErrors: BrowserErrorReporter;
@@ -174,6 +177,7 @@ export class SessionController {
     this.replacePromptEditorText = deps.replacePromptEditorText;
     this.onSelectedSessionReady = deps.onSelectedSessionReady;
     this.onModelScopeChanged = deps.onModelScopeChanged;
+    this.onModelUnavailable = deps.onModelUnavailable;
     this.captureNavigation = deps.captureNavigation;
     this.beginNavigationOperation = deps.beginNavigationOperation;
     this.browserErrors = new BrowserErrorReporter(getState, setState);
@@ -311,6 +315,7 @@ export class SessionController {
       if (session.archived === true) {
         const page = await this.api.messages(session, { limit: MESSAGE_PAGE_SIZE }, machineId);
         if (seq !== this.selectionSeq || this.getState().selectedSession?.id !== session.id || !navigationIsCurrent(options?.navigation)) return;
+        this.noteUnavailableModels(page.messages, machineId);
         const history = this.transcripts.mergeHistory(transcriptKey, page);
         this.setState({ ...history, isLoadingEarlierMessages: false, status: undefined, activity: undefined, pendingAsk: undefined, pendingDialogs: [], closedDialogs: [] });
         this.onSelectedSessionReady?.({ machineId, session });
@@ -388,6 +393,7 @@ export class SessionController {
     try {
       const page = await this.api.messages(session, { before: state.messagePageStart, limit: MESSAGE_PAGE_SIZE }, machineId);
       if (this.getState().selectedSession?.id !== session.id) return;
+      this.noteUnavailableModels(page.messages, machineId);
       const history = this.transcripts.mergeHistory(this.sessionCacheKey(session.id), page);
       this.setState(history);
     } catch (error) {
@@ -1333,6 +1339,7 @@ export class SessionController {
       // `applyEvent`; later events (`seq > watermark`) stream in on top. The
       // partial is seeded into the in-memory transcript only, never the raw
       // history cache, so it never persists.
+      this.noteUnavailableModels(page.messages, target.machineId);
       const history = this.transcripts.mergeHistory(key, page);
       const messages = this.transcripts.seedStreamingPartial(history.messages, streamSnapshot.partial);
       this.streamWatermark = { sessionId: target.session.id, seq: streamSnapshot.seq };
@@ -1974,6 +1981,7 @@ export class SessionController {
     }
 
     this.flushPendingUpdates();
+    this.noteUnavailableModelFromEvent(event);
     // Ask frames are applied after the buffered status they were published with,
     // so the card follows the daemon's own open/close order.
     if (event.type === "ask.opened") {
@@ -1998,6 +2006,24 @@ export class SessionController {
     } else if (event.type === "session.name") {
       this.applySessionName(event.sessionId, event.name);
     }
+  }
+
+  private noteUnavailableModels(messages: readonly unknown[], machineId: string): void {
+    for (const message of messages) this.noteUnavailableModel(message, machineId);
+  }
+
+  private noteUnavailableModelFromEvent(event: SessionUiEvent): void {
+    if (event.type !== "message.append" && event.type !== "message.end") return;
+    const session = this.getState().selectedSession;
+    if (session === undefined) return;
+    this.noteUnavailableModel(event.message, selectedMachineId(this.getState()));
+  }
+
+  private noteUnavailableModel(message: unknown, machineId: string): void {
+    if (!isGuardrailBlockedModelError(message)) return;
+    const model = guardrailBlockedModelFromMessage(message) ?? this.getState().status?.model;
+    if (model?.provider === undefined || model.id === undefined) return;
+    this.onModelUnavailable?.({ machineId, model: { provider: model.provider, id: model.id } });
   }
 
   private queueTranscriptEvent(event: SessionUiEvent): void {
@@ -2150,7 +2176,10 @@ export class SessionController {
       const events = this.pendingTranscriptEvents;
       this.pendingTranscriptEvents = [];
       let messages = this.getState().messages;
-      for (const event of events) messages = this.transcripts.applyLiveEvent(messages, event) ?? messages;
+      for (const event of events) {
+        this.noteUnavailableModelFromEvent(event);
+        messages = this.transcripts.applyLiveEvent(messages, event) ?? messages;
+      }
       if (messages !== this.getState().messages) this.setState({ messages });
     }
     if (this.pendingActivityBySession.size > 0) {
@@ -2344,4 +2373,3 @@ function isHighFrequencyTranscriptEvent(event: SessionUiEvent): boolean {
 function isSessionNotFoundError(error: unknown): boolean {
   return error instanceof Error && error.message.toLowerCase().includes("session not found");
 }
-

@@ -2,6 +2,7 @@ import { LitElement, css, html, nothing, type PropertyValues, type TemplateResul
 import { customElement, property, state } from "lit/decorators.js";
 import { repeat } from "lit/directives/repeat.js";
 import type { CommandOption, SessionModelCatalogEntry, SessionModelScopeMode } from "../api";
+import { modelIsUnavailable, modelValueIsUnavailable, type ModelAvailabilityFilter } from "../modelAvailability";
 import { keyboardEventOriginatesFromNativeActivationControl } from "./keyboardEventTarget";
 import "./ModalSurface";
 import { defaultPin, defaultPinHelp, defaultPinStyles } from "./DefaultPin";
@@ -25,10 +26,11 @@ export function modelCatalogEntryValue(entry: Pick<SessionModelCatalogEntry, "pr
 }
 
 /** Case-insensitive substring filter over the Enabled-mode options (CommandPicker semantics). */
-export function filterModelOptions(options: readonly CommandOption[], query: string): CommandOption[] {
+export function filterModelOptions(options: readonly CommandOption[], query: string, availability?: ModelAvailabilityFilter): CommandOption[] {
   const normalized = query.trim().toLowerCase();
-  if (normalized === "") return [...options];
-  return options.filter((option) => `${option.label} ${option.description ?? ""} ${option.value}`.toLowerCase().includes(normalized));
+  const visible = options.filter((option) => !modelValueIsUnavailable(option.value, availability));
+  if (normalized === "") return [...visible];
+  return visible.filter((option) => `${option.label} ${option.description ?? ""} ${option.value}`.toLowerCase().includes(normalized));
 }
 
 function modelCatalogInNaturalOrder(catalog: readonly SessionModelCatalogEntry[]): SessionModelCatalogEntry[] {
@@ -45,6 +47,7 @@ export function modelCatalogView(
   catalog: readonly SessionModelCatalogEntry[],
   query: string,
   stableOrder?: readonly string[],
+  availability?: ModelAvailabilityFilter,
 ): ModelCatalogView {
   const naturalRows = modelCatalogInNaturalOrder(catalog);
   const rowsByValue = new Map(naturalRows.map((entry) => [modelCatalogEntryValue(entry), entry]));
@@ -61,10 +64,11 @@ export function modelCatalogView(
         ...naturalRows.filter((entry) => !listed.has(modelCatalogEntryValue(entry))),
       ];
   const normalized = query.trim().toLowerCase();
+  const visibleRows = orderedRows.filter((entry) => !modelIsUnavailable(entry, availability));
   return {
     rows: normalized === ""
-      ? orderedRows
-      : orderedRows.filter((entry) => `${entry.provider} ${entry.id} ${entry.name ?? ""}`.toLowerCase().includes(normalized)),
+      ? visibleRows
+      : visibleRows.filter((entry) => `${entry.provider} ${entry.id} ${entry.name ?? ""}`.toLowerCase().includes(normalized)),
   };
 }
 
@@ -115,6 +119,9 @@ export class ModelPicker extends LitElement {
   @property({ attribute: false }) options: CommandOption[] = [];
   /** All-mode rows, including enabled state and (on current servers) each model's natural catalog index. Workspace overrides mark rows `editable: false`. */
   @property({ attribute: false }) catalog: SessionModelCatalogEntry[] = [];
+  /** Browser-local models hidden after a confirmed workspace policy rejection. */
+  @property({ attribute: false }) unavailableModelKeys: ReadonlySet<string> = new Set();
+  @property() modelAvailabilityMachineId = "local";
   @property({ attribute: false }) selectedValue?: string;
   @property({ attribute: false }) onPick?: (value: string) => void;
   @property({ attribute: false }) onCancel?: () => void;
@@ -189,20 +196,22 @@ export class ModelPicker extends LitElement {
   }
 
   protected override willUpdate(changed: PropertyValues<this>): void {
-    if (!changed.has("catalog")) return;
-    if (this.mode === "all") {
+    if (!changed.has("catalog") && !changed.has("unavailableModelKeys")) return;
+    if (changed.has("catalog") && this.mode === "all") {
       this.catalogScrollTopBeforeUpdate = this.shadowRoot?.querySelector<HTMLElement>(".options")?.scrollTop;
     }
-    this.rememberCatalogOrder();
-    if (this.mode !== "all") return;
+    if (changed.has("catalog")) this.rememberCatalogOrder();
+    if (this.mode !== "all") {
+      if (changed.has("unavailableModelKeys")) this.anchorSelectionToSelectedValue();
+      return;
+    }
 
     // The server keeps scope order enabled-first. Anchor keyboard selection by
     // value while the dialog's natural row order stays fixed across responses.
-    const previousCatalog = changed.get("catalog");
-    if (previousCatalog === undefined) return;
-    const previousRows = modelCatalogView(previousCatalog, this.query, this.catalogOrder).rows;
+    const previousCatalog = changed.get("catalog") ?? this.catalog;
+    const previousRows = modelCatalogView(previousCatalog, this.query, this.catalogOrder, this.availability).rows;
     const anchored = previousRows[this.selectedIndex];
-    const rows = modelCatalogView(this.catalog, this.query, this.catalogOrder).rows;
+    const rows = modelCatalogView(this.catalog, this.query, this.catalogOrder, this.availability).rows;
     const anchoredValue = anchored === undefined ? undefined : modelCatalogEntryValue(anchored);
     const nextIndex = anchoredValue === undefined ? -1 : rows.findIndex((entry) => modelCatalogEntryValue(entry) === anchoredValue);
     this.selectedIndex = nextIndex >= 0 ? nextIndex : Math.min(this.selectedIndex, Math.max(rows.length - 1, 0));
@@ -217,6 +226,10 @@ export class ModelPicker extends LitElement {
 
   private get membershipChangePending(): boolean {
     return this.toggleAllPending || this.pendingToggles.size > 0;
+  }
+
+  private get availability(): ModelAvailabilityFilter {
+    return { machineId: this.modelAvailabilityMachineId, unavailableModelKeys: this.unavailableModelKeys };
   }
 
   private get modelScopeEditable(): boolean {
@@ -253,7 +266,7 @@ export class ModelPicker extends LitElement {
   }
 
   private renderEnabledList(): TemplateResult[] {
-    return filterModelOptions(this.options, this.query).map((option, index) => {
+    return filterModelOptions(this.options, this.query, this.availability).map((option, index) => {
       const pick = html`<button
         class=${index === this.selectedIndex ? "selected" : ""}
         ?disabled=${this.membershipChangePending}
@@ -290,7 +303,7 @@ export class ModelPicker extends LitElement {
   }
 
   private renderCatalogList(): TemplateResult {
-    const rows = modelCatalogView(this.catalog, this.query, this.catalogOrder).rows;
+    const rows = modelCatalogView(this.catalog, this.query, this.catalogOrder, this.availability).rows;
     return html`${repeat(rows, modelCatalogEntryValue, (entry, index) => this.renderCatalogRow(entry, index))}`;
   }
 
@@ -331,9 +344,9 @@ export class ModelPicker extends LitElement {
 
   private visibleRows(): ModelPickerRow[] {
     if (this.mode === "all") {
-      return modelCatalogView(this.catalog, this.query, this.catalogOrder).rows.map((entry) => ({ value: modelCatalogEntryValue(entry), entry }));
+      return modelCatalogView(this.catalog, this.query, this.catalogOrder, this.availability).rows.map((entry) => ({ value: modelCatalogEntryValue(entry), entry }));
     }
-    return filterModelOptions(this.options, this.query).map((option) => ({ value: option.value }));
+    return filterModelOptions(this.options, this.query, this.availability).map((option) => ({ value: option.value }));
   }
 
   private anchorSelectionToSelectedValue(): void {

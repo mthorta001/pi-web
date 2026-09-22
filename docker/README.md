@@ -42,6 +42,10 @@ The installer fails closed on unknown or unsupported Docker setups, such as remo
 
 The Docker bootstrap does not require Node.js or npm on the host. It only needs a supported Docker/Compose setup plus `curl` or `wget`; Node and PI WEB are installed inside the local Docker image.
 
+### Podman status
+
+The current installer and `pi-web-docker` command target Docker Engine or Docker Desktop. Podman and `podman-compose` are not supported by the installer: host detection intentionally rejects alternate container runtimes, rootless sockets, and non-Docker socket paths. The Compose files may be useful as a starting point for an experienced Podman user, but a Podman deployment is not verified or covered by the runtime lifecycle commands. Full support would require a separate runtime abstraction for the CLI, socket mounts, host-profile detection, and `hostexec` behavior.
+
 Install with the bootstrap one-liner:
 
 ```bash
