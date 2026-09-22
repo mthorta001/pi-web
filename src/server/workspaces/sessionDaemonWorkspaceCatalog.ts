@@ -31,14 +31,59 @@ import {
 } from "./workspaceCatalog.js";
 
 const WORKSPACE_CATALOG_PATH = "/workspace-catalog";
+const DEFAULT_RESOLUTION_CACHE_TTL_MS = 2_000;
+
+export interface SessionDaemonWorkspaceCatalogOptions {
+  resolutionCacheTtlMs?: number;
+  now?: () => number;
+}
+
+interface ResolutionCacheEntry {
+  expiresAt: number;
+  resolution: WorkspaceProviderAuthorityResolution;
+}
 
 /** Narrow web adapter over sessiond's internal workspace-authority protocol. */
 export class SessionDaemonWorkspaceCatalog implements WorkspaceCatalog {
-  constructor(private readonly daemon: SessionDaemonRequestClient) {}
+  private readonly resolutionCacheTtlMs: number;
+  private readonly now: () => number;
+  private readonly pendingResolutions = new Map<string, Promise<WorkspaceProviderAuthorityResolution>>();
+  private readonly resolutionCache = new Map<string, ResolutionCacheEntry>();
+
+  constructor(
+    private readonly daemon: SessionDaemonRequestClient,
+    options: SessionDaemonWorkspaceCatalogOptions = {},
+  ) {
+    this.resolutionCacheTtlMs = positiveInteger(options.resolutionCacheTtlMs, DEFAULT_RESOLUTION_CACHE_TTL_MS, "resolutionCacheTtlMs");
+    this.now = options.now ?? (() => Date.now());
+  }
 
   async resolveProject(projectId: string): Promise<WorkspaceProviderAuthorityResolution> {
-    const value = await this.requestJson(`${WORKSPACE_CATALOG_PATH}/projects/${encodedId(projectId, "project")}/workspaces`);
-    return parseWorkspaceProviderResolution(value, projectId);
+    const cached = this.resolutionCache.get(projectId);
+    if (cached !== undefined) {
+      if (cached.expiresAt > this.now()) return cached.resolution;
+      this.resolutionCache.delete(projectId);
+    }
+    const existing = this.pendingResolutions.get(projectId);
+    if (existing !== undefined) return existing;
+
+    const pending = this.requestJson(`${WORKSPACE_CATALOG_PATH}/projects/${encodedId(projectId, "project")}/workspaces`)
+      .then((value) => parseWorkspaceProviderResolution(value, projectId))
+      .then((resolution) => {
+        if (resolution.status !== "degraded") {
+          this.resolutionCache.set(projectId, {
+            expiresAt: this.now() + this.resolutionCacheTtlMs,
+            resolution,
+          });
+        }
+        return resolution;
+      });
+    this.pendingResolutions.set(projectId, pending);
+    try {
+      return await pending;
+    } finally {
+      if (this.pendingResolutions.get(projectId) === pending) this.pendingResolutions.delete(projectId);
+    }
   }
 
   async list(projectId: string): Promise<WorkspaceListing[]> {
@@ -46,13 +91,9 @@ export class SessionDaemonWorkspaceCatalog implements WorkspaceCatalog {
   }
 
   async resolve(projectId: string, workspaceId: string): Promise<WorkspaceListing> {
-    const value = await this.requestJson(
-      `${WORKSPACE_CATALOG_PATH}/projects/${encodedId(projectId, "project")}/workspaces/${encodedId(workspaceId, "workspace")}`,
-    );
-    const workspace = parseWorkspace(value, "workspace resolution response");
-    if (workspace.projectId !== projectId || workspace.id !== workspaceId) {
-      throw protocolError("workspace resolution response did not match the requested project and workspace");
-    }
+    const resolution = await this.resolveProject(projectId);
+    const workspace = resolution.workspaces.find((candidate) => candidate.id === workspaceId);
+    if (workspace === undefined) throw new WorkspaceCatalogRequestError("Workspace not found", 404);
     return workspace;
   }
 
@@ -413,6 +454,12 @@ function isCatalogDiagnosticCode(value: unknown): value is PiWebPluginCatalogDia
 function encodedId(value: string, label: string): string {
   if (value === "") throw new Error(`${label} id must be a non-empty string`);
   return encodeURIComponent(value);
+}
+
+function positiveInteger(value: number | undefined, fallback: number, key: string): number {
+  const resolved = value ?? fallback;
+  if (!Number.isInteger(resolved) || resolved <= 0) throw new Error(`${key} must be a positive integer`);
+  return resolved;
 }
 
 function workspaceCatalogRequestMessage(statusCode: number, body: string): string {

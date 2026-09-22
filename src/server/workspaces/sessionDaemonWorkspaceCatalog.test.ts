@@ -33,6 +33,23 @@ const providerWorkspace = {
 };
 
 describe("SessionDaemonWorkspaceCatalog", () => {
+  it("coalesces concurrent topology reads and refreshes them after the short TTL", async () => {
+    let now = 0;
+    const request = vi.fn<SessionDaemonRequestClient["request"]>(() => Promise.resolve(jsonResponse(providerResolution([providerWorkspace]))));
+    const catalog = new SessionDaemonWorkspaceCatalog({ request }, {
+      resolutionCacheTtlMs: 1_000,
+      now: () => now,
+    });
+
+    await Promise.all([catalog.resolveProject("project a"), catalog.resolveProject("project a")]);
+    await catalog.resolveProject("project a");
+    expect(request).toHaveBeenCalledOnce();
+
+    now = 1_001;
+    await catalog.resolveProject("project a");
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
   it("uses encoded daemon operations and preserves provider metadata without restoring removed top-level aliases", async () => {
     const request = vi.fn<SessionDaemonRequestClient["request"]>((_method, path) => Promise.resolve(jsonResponse(
       path.endsWith("/w%2F1") ? providerWorkspace : providerResolution([providerWorkspace]),
@@ -44,8 +61,8 @@ describe("SessionDaemonWorkspaceCatalog", () => {
     const resolved = await catalog.resolve("project a", "w/1");
 
     expect(request).toHaveBeenNthCalledWith(1, "GET", "/workspace-catalog/projects/project%20a/workspaces");
-    expect(request).toHaveBeenNthCalledWith(2, "GET", "/workspace-catalog/projects/project%20a/workspaces");
-    expect(request).toHaveBeenNthCalledWith(3, "GET", "/workspace-catalog/projects/project%20a/workspaces/w%2F1");
+    expect(request).toHaveBeenCalledOnce();
+    expect(request).toHaveBeenCalledWith("GET", "/workspace-catalog/projects/project%20a/workspaces");
     expect(resolution).toMatchObject({
       status: "provider",
       projectId: "project a",
