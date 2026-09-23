@@ -357,6 +357,7 @@ pi_web_docker_host_write_existing_volume() {
 
 pi_web_docker_host_write_extra_volumes() {
   extra_paths=$1
+  skills_path=${2:-}
 
   for extra_path in $extra_paths; do
     case "$extra_path" in
@@ -372,8 +373,72 @@ pi_web_docker_host_write_extra_volumes() {
       return 1
     fi
 
+    if [ -n "$skills_path" ]; then
+      if [ -d "$extra_path" ]; then
+        normalized_extra_path=$(CDPATH= cd "$extra_path" 2>/dev/null && pwd -P) || return 1
+      else
+        extra_parent=$(CDPATH= cd "$(dirname "$extra_path")" 2>/dev/null && pwd -P) || return 1
+        normalized_extra_path=$extra_parent/$(basename "$extra_path")
+      fi
+      case "$normalized_extra_path" in
+        "$skills_path"|"$skills_path"/*)
+          printf '%s\n' "PI_WEB_DOCKER_EXTRA_HOST_PATHS must not add a writable mount at or below PI_WEB_DOCKER_SKILLS_DIR: $extra_path" >&2
+          return 1
+          ;;
+      esac
+    fi
+
     pi_web_docker_host_write_volume "$extra_path" "$extra_path" false
   done
+}
+
+pi_web_docker_host_normalize_skills_dir() {
+  pi_web_docker_skills_input=$1
+  [ -n "$pi_web_docker_skills_input" ] || return 0
+
+  case "$pi_web_docker_skills_input" in
+    /*) ;;
+    *)
+      printf '%s\n' "PI_WEB_DOCKER_SKILLS_DIR must be an absolute path: $pi_web_docker_skills_input" >&2
+      return 1
+      ;;
+  esac
+
+  if [ ! -d "$pi_web_docker_skills_input" ]; then
+    printf '%s\n' "PI_WEB_DOCKER_SKILLS_DIR must be an existing directory: $pi_web_docker_skills_input" >&2
+    return 1
+  fi
+
+  pi_web_docker_skills_normalized=$(CDPATH= cd "$pi_web_docker_skills_input" 2>/dev/null && pwd -P) || {
+    printf '%s\n' "could not resolve PI_WEB_DOCKER_SKILLS_DIR: $pi_web_docker_skills_input" >&2
+    return 1
+  }
+
+  case "$pi_web_docker_skills_normalized" in
+    */skills) ;;
+    *)
+      printf '%s\n' "PI_WEB_DOCKER_SKILLS_DIR must point to a dedicated directory named skills: $pi_web_docker_skills_normalized" >&2
+      return 1
+      ;;
+  esac
+
+  [ "$pi_web_docker_skills_normalized" != /skills ] || {
+    printf '%s\n' "PI_WEB_DOCKER_SKILLS_DIR must not be the filesystem-level /skills directory" >&2
+    return 1
+  }
+
+  printf '%s\n' "$pi_web_docker_skills_normalized"
+}
+
+pi_web_docker_host_write_skills_volumes() {
+  pi_web_docker_skills_path=$(pi_web_docker_host_normalize_skills_dir "$1") || return 1
+  [ -n "$pi_web_docker_skills_path" ] || return 0
+
+  # The host tree may already be mounted read/write for workspace access.
+  # Overlay its skills directory as read-only there as well as at Pi's global
+  # discovery path, so agents cannot write through the original host path.
+  pi_web_docker_host_write_volume "$pi_web_docker_skills_path" "$pi_web_docker_skills_path" true
+  pi_web_docker_host_write_volume "$pi_web_docker_skills_path" /data/home/.agents/skills true
 }
 
 # Create the user-owned container environment file once, without ever
@@ -428,9 +493,16 @@ pi_web_docker_host_write_compose_override() {
   host_profile=$2
   extra_paths=${3:-}
   control_path=${4:-}
+  skills_dir=${5:-}
   target_dir=$(dirname "$target_file")
   mkdir -p "$target_dir" || return 1
   PI_WEB_DOCKER_HOST_OVERRIDE_TEMP=$target_file.$$
+
+  if normalized_skills_dir=$(pi_web_docker_host_normalize_skills_dir "$skills_dir"); then
+    skills_dir=$normalized_skills_dir
+  else
+    return 1
+  fi
 
   case "$host_profile" in
     linux-native-docker) hostexec_mode=nsenter ;;
@@ -480,7 +552,7 @@ EOF
       ;;
   esac
 
-  if ! pi_web_docker_host_write_extra_volumes "$extra_paths"; then
+  if ! pi_web_docker_host_write_extra_volumes "$extra_paths" "$skills_dir"; then
     rm -f "$PI_WEB_DOCKER_HOST_OVERRIDE_TEMP"
     return 1
   fi
@@ -492,6 +564,11 @@ EOF
       return 1
     fi
     pi_web_docker_host_write_volume "$control_path" "$control_path" false
+  fi
+
+  if ! pi_web_docker_host_write_skills_volumes "$skills_dir"; then
+    rm -f "$PI_WEB_DOCKER_HOST_OVERRIDE_TEMP"
+    return 1
   fi
 
   cat >>"$PI_WEB_DOCKER_HOST_OVERRIDE_TEMP" <<EOF

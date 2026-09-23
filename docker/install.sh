@@ -52,6 +52,8 @@ Progressive host setup:
   recreated. Set
   PI_WEB_DOCKER_EXTRA_HOST_PATHS to a whitespace-separated list of additional
   existing absolute directories to bind-mount at the same path in the containers.
+  PI_WEB_DOCKER_SKILLS_DIR to expose a dedicated host skills directory read-only
+  to Pi. It defaults to $HOME/.agents/skills when that directory exists.
 
 Container environment:
   Extra environment variables for the sessiond/web containers belong in
@@ -408,6 +410,14 @@ compose_project_name=$(value_from_env_or_existing_or_default COMPOSE_PROJECT_NAM
 hostexec_image=$(value_from_env_or_existing_or_default HOSTEXEC_IMAGE alpine:3.22)
 pi_web_max_upload_bytes=$(value_from_env_or_existing_or_default PI_WEB_MAX_UPLOAD_BYTES 67108864)
 pi_web_extra_host_paths=$(value_from_env_or_existing_or_default PI_WEB_DOCKER_EXTRA_HOST_PATHS "")
+default_skills_dir=
+if [ -n "${HOME:-}" ] && [ -d "$HOME/.agents/skills" ]; then
+  default_skills_dir=$HOME/.agents/skills
+fi
+pi_web_skills_dir=$(value_from_env_or_existing_or_default PI_WEB_DOCKER_SKILLS_DIR "$default_skills_dir")
+if ! pi_web_skills_dir=$(pi_web_docker_host_normalize_skills_dir "$pi_web_skills_dir"); then
+  die "invalid PI_WEB_DOCKER_SKILLS_DIR"
+fi
 
 require_non_empty PI_WEB_UID "$pi_web_uid"
 require_non_empty PI_WEB_GID "$pi_web_gid"
@@ -434,8 +444,9 @@ require_non_empty PI_WEB_MAX_UPLOAD_BYTES "$pi_web_max_upload_bytes"
 
 pi_web_extra_zypper_packages_env=$(dotenv_quote "$pi_web_extra_zypper_packages")
 pi_web_extra_host_paths_env=$(dotenv_quote "$pi_web_extra_host_paths")
+pi_web_skills_dir_env=$(dotenv_quote "$pi_web_skills_dir")
 compose_override_file=$install_dir/compose.override.yml
-if ! pi_web_docker_host_write_compose_override "$compose_override_file" "$pi_web_host_profile" "$pi_web_extra_host_paths" "$install_dir"; then
+if ! pi_web_docker_host_write_compose_override "$compose_override_file" "$pi_web_host_profile" "$pi_web_extra_host_paths" "$install_dir" "$pi_web_skills_dir"; then
   die "could not write host-specific Compose override"
 fi
 
@@ -462,6 +473,7 @@ PI_WEB_DOCKER_HOST_PROFILE=$pi_web_host_profile
 PI_WEB_DOCKER_SOCKET_SOURCE=$docker_socket_source
 HOSTEXEC_MODE=$hostexec_mode
 PI_WEB_DOCKER_EXTRA_HOST_PATHS=$pi_web_extra_host_paths_env
+PI_WEB_DOCKER_SKILLS_DIR=$pi_web_skills_dir_env
 
 # Persistent data, Docker control root, and localhost-only default exposure.
 PI_WEB_DOCKER_DATA_DIR=$data_dir
