@@ -318,6 +318,8 @@ Use this mode when developing PI WEB from this checkout. It bind-mounts the sour
 
 Use `./docker/pi-web-docker --dev restart` to restart both services. It handles plugin-build readiness and restart order for you. Restarting interrupts active sessions, so wait for important work to finish first.
 
+The development `web` and `sessiond` containers use the `unless-stopped` restart policy, so Podman restarts them when its machine becomes available again. This does not start the Podman machine itself; configure Podman Desktop or the machine to start at login. The session daemon's Unix socket is kept in a Compose-managed volume at `/run/pi-web`, rather than the macOS-shared `/data` bind mount, where Unix socket operations may fail. Leave `PI_WEB_DEV_SESSIOND_SOCKET` unset to use `/run/pi-web/sessiond-dev.sock`, or set it to a path under `/run/pi-web`.
+
 From the repository root, use the canonical Docker command so the same fail-closed host profile detection is applied as runtime mode:
 
 ```bash

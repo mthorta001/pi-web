@@ -159,6 +159,22 @@ describe("Docker command assets", () => {
     expect(web).not.toContain("/api/pi-web/runtime");
   });
 
+  it("restarts development services and keeps the session socket in a Compose volume", async () => {
+    const compose = await readRepoFile("docker/compose.dev.yml");
+    const dataInit = compose.split("\n  data-init:")[1]?.split("\n  sessiond:")[0];
+    const sessiond = compose.split("\n  sessiond:")[1]?.split("\n  web:")[0];
+    const web = compose.split("\n  web:")[1]?.split("\nvolumes:")[0];
+
+    expect(compose).toContain("PI_WEB_SESSIOND_SOCKET: ${PI_WEB_DEV_SESSIOND_SOCKET:-/run/pi-web/sessiond-dev.sock}");
+    expect(compose).toContain("source: sessiond_socket\n    target: /run/pi-web");
+    expect(compose).toContain("  sessiond_socket:\n");
+    expect(dataInit).toContain("/data/pi-agent /run/pi-web");
+    expect(dataInit).toContain("chown \"${PI_WEB_UID:-1000}:${PI_WEB_GID:-1000}\" /data/pi-web");
+    expect(sessiond).toContain("restart: unless-stopped");
+    expect(sessiond).toContain("test -S ${PI_WEB_DEV_SESSIOND_SOCKET:-/run/pi-web/sessiond-dev.sock}");
+    expect(web).toContain("restart: unless-stopped");
+  });
+
   it("gives both modes the same user-owned container environment file in the shared data directory", async () => {
     const [runtimeCompose, devCompose, installer, devWrapper, hostProfile] = await Promise.all([
       readRepoFile("docker/compose.yml"),
@@ -357,6 +373,7 @@ describe("Docker command assets", () => {
     expect(generatedEnv).toContain("DOCKER_GID=0\n");
     expect(generatedEnv).toContain(`PI_WEB_DOCKER_DATA_DIR=${runtimeDataDir}\n`);
     expect(generatedEnv).toContain(`PI_WEB_DOCKER_DEV_REPO_ROOT=${devRoot}\n`);
+    expect(generatedEnv).toContain("PI_WEB_DEV_SESSIOND_SOCKET=/run/pi-web/sessiond-dev.sock\n");
     expect(generatedEnv).toContain("COMPOSE_PROJECT_NAME=pi-web-dev\n");
     expect(generatedEnv).toContain("PI_WEB_DEV_API_BIND_ADDR=0.0.0.0\n");
     expect(generatedEnv).not.toContain("COMPOSE_PROJECT_NAME=runtime-project");
@@ -374,6 +391,7 @@ describe("Docker command assets", () => {
 
     const localConfig = await readFile(join(devRoot, ".pi-web", "docker-compose-dev.local.env"), "utf8");
     expect(localConfig).toContain("docker/pi-web-docker --dev creates this file once");
+    expect(localConfig).toContain("PI_WEB_DEV_SESSIOND_SOCKET defaults to /run/pi-web/sessiond-dev.sock");
     expect(localConfig).toContain("PI_WEB_UID and PI_WEB_GID default to the current host user");
     const override = await readFile(join(devRoot, ".pi-web", "docker-compose-dev.host.generated.yml"), "utf8");
     expect(override).toContain(socketPath);

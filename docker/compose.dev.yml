@@ -16,7 +16,7 @@ x-pi-web-dev-environment: &pi-web-dev-environment
   HOME: /data/home
   XDG_CONFIG_HOME: /data/config
   PI_WEB_DATA_DIR: /data/pi-web
-  PI_WEB_SESSIOND_SOCKET: ${PI_WEB_DEV_SESSIOND_SOCKET:-/data/pi-web/sessiond-dev.sock}
+  PI_WEB_SESSIOND_SOCKET: ${PI_WEB_DEV_SESSIOND_SOCKET:-/run/pi-web/sessiond-dev.sock}
   PI_CODING_AGENT_DIR: /data/pi-agent
   HOSTEXEC_IMAGE: ${HOSTEXEC_IMAGE:-alpine:3.22}
   HOSTEXEC_MODE: ${HOSTEXEC_MODE:-disabled}
@@ -56,6 +56,9 @@ x-pi-web-dev-volumes: &pi-web-dev-volumes
     target: /workspace/node_modules
   - *pi-web-dev-data-volume
   - *pi-web-dev-agent-volume
+  - type: volume
+    source: sessiond_socket
+    target: /run/pi-web
 
 services:
   data-init:
@@ -66,8 +69,9 @@ services:
       - -lc
       - |
         set -euo pipefail
-        mkdir -p /data/home /data/config /data/npm-cache /data/pi-web /data/pi-agent
-        chown -R "${PI_WEB_UID:-1000}:${PI_WEB_GID:-1000}" /data
+        mkdir -p /data/home /data/config /data/npm-cache /data/pi-web /data/pi-agent /run/pi-web
+        chown -R "${PI_WEB_UID:-1000}:${PI_WEB_GID:-1000}" /data/home /data/config /data/npm-cache /data/pi-agent /run/pi-web
+        chown "${PI_WEB_UID:-1000}:${PI_WEB_GID:-1000}" /data/pi-web
         /usr/local/sbin/pi-web-dev-sync-node-modules
     user: "0:0"
     security_opt:
@@ -82,6 +86,7 @@ services:
     build: *pi-web-dev-build
     image: ${PI_WEB_DEV_IMAGE:-pi-web:dev}
     command: ["npm", "run", "start:sessiond"]
+    restart: unless-stopped
     working_dir: /workspace
     depends_on:
       web:
@@ -95,7 +100,7 @@ services:
     environment: *pi-web-dev-environment
     volumes: *pi-web-dev-volumes
     healthcheck:
-      test: ["CMD-SHELL", "test -S ${PI_WEB_DEV_SESSIOND_SOCKET:-/data/pi-web/sessiond-dev.sock}"]
+      test: ["CMD-SHELL", "test -S ${PI_WEB_DEV_SESSIOND_SOCKET:-/run/pi-web/sessiond-dev.sock}"]
       interval: 5s
       timeout: 3s
       retries: 24
@@ -105,6 +110,7 @@ services:
     build: *pi-web-dev-build
     image: ${PI_WEB_DEV_IMAGE:-pi-web:dev}
     command: ["bash", "-lc", "trap 'kill 0' EXIT; npm run dev:web & npm run dev:client & wait"]
+    restart: unless-stopped
     working_dir: /workspace
     depends_on:
       data-init:
@@ -132,3 +138,4 @@ services:
 
 volumes:
   node_modules:
+  sessiond_socket:
