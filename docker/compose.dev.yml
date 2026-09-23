@@ -70,7 +70,8 @@ services:
       - |
         set -euo pipefail
         mkdir -p /data/home /data/config /data/npm-cache /data/pi-web /data/pi-agent /run/pi-web
-        chown -R "${PI_WEB_UID:-1000}:${PI_WEB_GID:-1000}" /data/home /data/config /data/npm-cache /data/pi-agent /run/pi-web
+        chown "${PI_WEB_UID:-1000}:${PI_WEB_GID:-1000}" /data/home
+        chown -R "${PI_WEB_UID:-1000}:${PI_WEB_GID:-1000}" /data/config /data/npm-cache /data/pi-agent /run/pi-web
         chown "${PI_WEB_UID:-1000}:${PI_WEB_GID:-1000}" /data/pi-web
         /usr/local/sbin/pi-web-dev-sync-node-modules
     user: "0:0"

@@ -169,6 +169,8 @@ describe("Docker command assets", () => {
     expect(compose).toContain("source: sessiond_socket\n    target: /run/pi-web");
     expect(compose).toContain("  sessiond_socket:\n");
     expect(dataInit).toContain("/data/pi-agent /run/pi-web");
+    expect(dataInit).toContain('chown "${PI_WEB_UID:-1000}:${PI_WEB_GID:-1000}" /data/home');
+    expect(dataInit).not.toContain('chown -R "${PI_WEB_UID:-1000}:${PI_WEB_GID:-1000}" /data/home');
     expect(dataInit).toContain("chown \"${PI_WEB_UID:-1000}:${PI_WEB_GID:-1000}\" /data/pi-web");
     expect(sessiond).toContain("restart: unless-stopped");
     expect(sessiond).toContain("test -S ${PI_WEB_DEV_SESSIOND_SOCKET:-/run/pi-web/sessiond-dev.sock}");
