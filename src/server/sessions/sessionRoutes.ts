@@ -213,6 +213,15 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionRou
     }
   });
 
+  app.post<{ Params: { sessionId: string }; Body: { cwd?: unknown } | undefined }>(`${prefix}/sessions/:sessionId/models/recheck`, async (request, reply) => {
+    try {
+      const body = optionalRecord(request.body);
+      return { models: await sessions.recheckModelAvailability(sessionRefFromBody(request.params.sessionId, body)) };
+    } catch (error) {
+      return reply.code(mutationErrorStatus(error)).send({ error: errorMessage(error) });
+    }
+  });
+
   app.post<{ Params: { sessionId: string }; Body: { cwd?: unknown; provider?: unknown; modelId?: unknown; enabled?: unknown } | undefined }>(`${prefix}/sessions/:sessionId/models/enabled`, async (request, reply) => {
     try {
       const body = optionalRecord(request.body);

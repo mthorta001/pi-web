@@ -133,6 +133,8 @@ export class ModelPicker extends LitElement {
   @property({ attribute: false }) onToggleEnabled?: (provider: string, modelId: string, enabled: boolean) => unknown;
   /** Atomically applies the bulk availability preset selected by the toggle-all action. */
   @property({ attribute: false }) onSetScope?: (mode: SessionModelScopeMode) => unknown;
+  /** Clears learned workspace-policy denials so the user can retry after a policy change. */
+  @property({ attribute: false }) onRecheckAvailability?: () => unknown;
 
   @property({ attribute: false }) defaultValue?: string;
   /** Host applies the default and reports save errors. */
@@ -144,6 +146,7 @@ export class ModelPicker extends LitElement {
   @state() private query = "";
   @state() private pendingToggles: ReadonlySet<string> = new Set();
   @state() private toggleAllPending = false;
+  @state() private recheckPending = false;
   /** Stable for this dialog's lifetime so membership responses never move natural rows. */
   private catalogOrder: string[] = [];
   private catalogScrollTopBeforeUpdate: number | undefined;
@@ -176,6 +179,14 @@ export class ModelPicker extends LitElement {
           <input class="search" aria-label="Search models" placeholder="Search" .value=${this.query} @input=${(event: Event) => { this.handleSearchInput(event); }}>
           ${this.mode === "all" ? this.renderToggleAllButton() : nothing}
         </div>
+        ${this.onRecheckAvailability === undefined ? nothing : html`
+          <div class="recheck-row">
+            <button ?disabled=${this.recheckPending || this.membershipChangePending} @click=${() => { this.requestAvailabilityRecheck(); }}>
+              ${this.recheckPending ? "Rechecking blocked models…" : "Recheck blocked models"}
+            </button>
+            <span>Use after a workspace guardrail or credential change.</span>
+          </div>
+        `}
         ${this.onSetDefault ? defaultPinHelp : nothing}
         <div
           class="options"
@@ -472,6 +483,22 @@ export class ModelPicker extends LitElement {
     }
   }
 
+  private requestAvailabilityRecheck(): void {
+    if (this.recheckPending || this.membershipChangePending) return;
+    this.recheckPending = true;
+    void this.settleAvailabilityRecheck();
+  }
+
+  private async settleAvailabilityRecheck(): Promise<void> {
+    try {
+      await this.onRecheckAvailability?.();
+    } catch (error: unknown) {
+      console.warn("Failed to recheck blocked models", error);
+    } finally {
+      this.recheckPending = false;
+    }
+  }
+
   static override styles = [css`
     :host { position: fixed; inset: 0; z-index: 10; color: var(--pi-text); font: 14px system-ui, sans-serif; }
     modal-surface { --modal-surface-width: min(720px, calc(100vw - 40px)); --modal-surface-max-height: min(640px, calc(100vh - 40px)); }
@@ -491,6 +518,10 @@ export class ModelPicker extends LitElement {
     .toggle-all { flex: none; padding: 8px 10px; border: 1px solid var(--pi-border); border-radius: 8px; white-space: nowrap; }
     .toggle-all:hover:not(:disabled) { background: var(--pi-selection-bg); }
     .toggle-all:disabled { cursor: default; opacity: 0.55; }
+    .recheck-row { display: flex; align-items: center; gap: 8px; margin: -2px 12px 10px; color: var(--pi-muted); font-size: 12px; }
+    .recheck-row button { flex: none; padding: 5px 8px; border: 1px solid var(--pi-border); border-radius: 6px; white-space: nowrap; }
+    .recheck-row button:hover:not(:disabled) { background: var(--pi-selection-bg); }
+    .recheck-row button:disabled { cursor: default; opacity: 0.55; }
     .scope-status { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
     .options > button { display: block; width: 100%; padding: 10px 12px; border-bottom: 1px solid var(--pi-border-muted); text-align: left; }
     .options > button.selected, .options > button:hover { background: var(--pi-selection-bg); }

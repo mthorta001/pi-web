@@ -100,6 +100,8 @@ import {
 import { plainTextTheme } from "./plainTextTheme.js";
 import { SessionUnreadStore, type SessionUnreadMutation } from "./sessionUnreadStore.js";
 import { applyEnabledModelToggle, catalogWithEnabledFirst, modelScopeId, persistedEnabledModelPatterns, resolveEnabledModelIds, resolveSessionModelOptions, scopedModelsFromEnabledIds, type EnabledModelCatalogEntry } from "./sessionModelScope.js";
+import { guardrailBlockedModelFromMessage } from "../../shared/modelAvailability.js";
+import { FileModelAvailabilityStore, type ModelAvailabilityStore } from "./modelAvailabilityStore.js";
 
 /**
  * Minimal structured-logging seam, shaped like Fastify's logger so sessiond can
@@ -108,6 +110,7 @@ import { applyEnabledModelToggle, catalogWithEnabledFirst, modelScopeId, persist
  */
 export interface PiSessionLogger {
   info(details: Record<string, unknown>, message: string): void;
+  warn?(details: Record<string, unknown>, message: string): void;
 }
 
 const noopLogger: PiSessionLogger = { info() { /* no-op */ } };
@@ -128,6 +131,10 @@ const STARTUP_PHASE_EXTENSIONS = "Loading session extensions";
 const STARTUP_CONCURRENT_CATALOG_REFRESH = "provider model lists are refreshing";
 const MAX_UNREAD_PUBLICATION_RETRY_MS = 30_000;
 const MAX_PENDING_UNREAD_MUTATIONS = SESSION_UNREAD_LIMIT + 1;
+/** One daemon-start backfill must remain bounded even on a long-lived profile. */
+const MAX_MODEL_AVAILABILITY_HISTORY_SESSIONS = 256;
+const MODEL_AVAILABILITY_HISTORY_CONCURRENCY = 8;
+const MODEL_AVAILABILITY_HISTORY_RETRY_MS = 30_000;
 /**
  * Upper bound on how often one idle runtime re-resolves its transcript file.
  * A runtime created in memory and never persisted has no session file, so
@@ -1134,6 +1141,8 @@ export interface PiSessionServiceDependencies {
    * project-local layer applies on top of the built-in defaults.
    */
   config?: Pick<PiWebConfigService, "read">;
+  /** Durable, per-profile workspace-policy state. Defaults to `$PI_WEB_DATA_DIR`. */
+  modelAvailabilityStore?: ModelAvailabilityStore;
 }
 
 export class PiSessionService implements SessionRouteService {
@@ -1167,8 +1176,20 @@ export class PiSessionService implements SessionRouteService {
   private readonly modelScopeStates = new Map<string, ModelScopeSnapshot>();
   /** Coalesces initialization reads independently for the global and each workspace scope. */
   private readonly modelScopeInitializations = new Map<string, Promise<ModelScopeSnapshot>>();
-  /** Monotonic revision published for global scope changes and consumed by clients. */
+  /** Monotonic revision published for scope or learned model-availability changes. */
   private modelScopeRevision = 0;
+  /** Models confirmed unavailable by a workspace guardrail and shared by all sessions. */
+  private readonly unavailableModelIds = new Set<string>();
+  private unavailableModelIdsLoaded = false;
+  private unavailableModelIdsLoad: Promise<void> | undefined;
+  private unavailableModelIdsPersistence: Promise<void> = Promise.resolve();
+  private readonly modelAvailabilityStore: ModelAvailabilityStore;
+  /** Open-session scans retry after empty or failed transcript reads rather than becoming sticky. */
+  private readonly unavailableModelHistoryScanned = new WeakSet<PiAgentSession>();
+  private readonly unavailableModelHistoryScans = new WeakMap<PiAgentSession, Promise<void>>();
+  private readonly unavailableModelHistoryRetryAt = new WeakMap<PiAgentSession, number>();
+  /** Non-blocking daemon-wide recovery for state written before policy persistence existed. */
+  private unavailableModelHistoryBackfill: Promise<void> | undefined;
   /** Last scope/catalog revision projected into each runtime, synchronized lazily on use. */
   private readonly modelScopeCache = new WeakMap<PiAgentSession, SessionModelScopeCache>();
   /** Runtime/session-identity reservations for operations that must not overlap tree navigation. */
@@ -1231,6 +1252,7 @@ export class PiSessionService implements SessionRouteService {
     this.agentDir = deps.agentDir;
     this.sessionManager = deps.sessionManager;
     this.modelRuntime = deps.modelRuntime;
+    this.modelAvailabilityStore = deps.modelAvailabilityStore ?? new FileModelAvailabilityStore();
     this.spawnTargets = deps.spawnTargets;
     this.logger = deps.logger ?? noopLogger;
     this.now = deps.now ?? (() => new Date());
@@ -1302,6 +1324,7 @@ export class PiSessionService implements SessionRouteService {
       },
       { listSessionNames: (cwd) => this.listSessionNames(cwd) },
     );
+    this.startUnavailableModelHistoryBackfill();
   }
 
   activeCount(): number {
@@ -1445,6 +1468,8 @@ export class PiSessionService implements SessionRouteService {
       }
     })).finally(() => this.activityMarker.dispose());
     await this.publishUnreadMutations([]);
+    await this.unavailableModelHistoryBackfill;
+    await this.unavailableModelIdsPersistence;
   }
 
   async list(cwd: string): Promise<ClientSession[]> {
@@ -1569,11 +1594,14 @@ export class PiSessionService implements SessionRouteService {
     if (this.spawnTargets === undefined) throw new Error("Spawning sessions is disabled");
     const decision = await this.spawnTargets.resolveSpawnTarget(input.spawningCwd, input.cwd);
     if (!decision.allowed) throw spawnTargetError(decision);
-    // A model spec overrides the inherited model. Only a spec resolves
-    // against the spawning session; the default path must not depend on it.
-    const model = input.modelSpec === undefined
-      ? input.model
-      : await this.resolveSpawnModel({ id: input.spawningSessionId, cwd: input.spawningCwd }, input.modelSpec);
+    // Resolve both explicit and inherited models through the parent's policy.
+    // An inherited model can be stale after a guardrail failure just as an
+    // explicit override can, so it must never bypass the availability check.
+    const model = await this.resolveSpawnModelInput(
+      { id: input.spawningSessionId, cwd: input.spawningCwd },
+      input.model,
+      input.modelSpec,
+    );
     const created = await this.start(decision.cwd, {
       ...(model === undefined ? {} : { initialModel: model }),
       ...(input.thinkingLevel === undefined ? {} : { initialThinkingLevel: input.thinkingLevel }),
@@ -1608,11 +1636,12 @@ export class PiSessionService implements SessionRouteService {
     // from an unregistered directory, which keeps the child visible in the UI.
     const decision = await this.spawnTargets.resolveSpawnTarget(input.spawningCwd, undefined);
     if (!decision.allowed) throw spawnTargetError(decision);
-    // A model spec overrides the inherited model and is resolved against the
-    // parent's model runtime; only a spec resolves against the parent.
-    const model = input.modelSpec === undefined
-      ? input.model
-      : await this.resolveSpawnModel({ id: input.parentSessionId, cwd: input.spawningCwd }, input.modelSpec);
+    // Apply the same policy check to an inherited tracked-child model.
+    const model = await this.resolveSpawnModelInput(
+      { id: input.parentSessionId, cwd: input.spawningCwd },
+      input.model,
+      input.modelSpec,
+    );
     const created = await this.startSession(decision.cwd, {
       ...(input.parentSessionFile === undefined ? {} : { parentSession: input.parentSessionFile }),
       ...(model === undefined ? {} : { initialModel: model }),
@@ -1709,7 +1738,7 @@ export class PiSessionService implements SessionRouteService {
    */
   private async sessionModelCandidates(session: PiAgentSession): Promise<readonly AgentModel[]> {
     await session.modelRuntime.refresh({ allowNetwork: false });
-    const available = session.modelRuntime.getAvailableSnapshot();
+    const available = await this.availableModelsAfterPolicy(session);
     await this.synchronizeSessionModelScope(session, available);
     return session.scopedModels.length > 0
       ? session.scopedModels.map((scoped) => scoped.model)
@@ -1724,11 +1753,143 @@ export class PiSessionService implements SessionRouteService {
    */
   private async enabledModelCatalog(session: PiAgentSession): Promise<EnabledModelCatalogEntry<AgentModel>[]> {
     await session.modelRuntime.refresh({ allowNetwork: false });
-    const available = session.modelRuntime.getAvailableSnapshot();
+    const available = await this.availableModelsAfterPolicy(session);
     await this.synchronizeSessionModelScope(session, available);
     const context = this.modelScopeContext(session);
     const enabledIds = (await this.modelScopeSnapshot(session, context)).enabledIds;
     return catalogWithEnabledFirst(available, enabledIds);
+  }
+
+  /**
+   * Provider catalogs describe registered models, not workspace policy. Learn
+   * confirmed guardrail failures from the session transcript before exposing
+   * the catalog so every client connected to this daemon sees the same filter.
+   */
+  private async availableModelsAfterPolicy(session: PiAgentSession): Promise<AgentModel[]> {
+    await this.loadUnavailableModelIds();
+    await this.scanUnavailableModelHistory({ id: session.sessionId, cwd: session.sessionManager.getCwd() }, session);
+    return session.modelRuntime.getAvailableSnapshot().filter((model) => !this.unavailableModelIds.has(modelScopeId(model)));
+  }
+
+  private async loadUnavailableModelIds(): Promise<void> {
+    if (this.unavailableModelIdsLoaded) return;
+    if (this.unavailableModelIdsLoad !== undefined) return this.unavailableModelIdsLoad;
+    const load = (async () => {
+      const ids = await this.modelAvailabilityStore.load(this.agentDir);
+      for (const id of ids) {
+        if (id.length > 0) this.unavailableModelIds.add(id);
+      }
+      this.unavailableModelIdsLoaded = true;
+    })();
+    this.unavailableModelIdsLoad = load;
+    try {
+      await load;
+    } finally {
+      if (this.unavailableModelIdsLoad === load) this.unavailableModelIdsLoad = undefined;
+    }
+  }
+
+  private observeModelAvailabilityMessages(messages: readonly unknown[]): void {
+    for (const message of messages) this.observeModelAvailabilityMessage(message);
+  }
+
+  private observeModelAvailabilityMessage(message: unknown): void {
+    const blocked = guardrailBlockedModelFromMessage(message)
+      ?? guardrailBlockedModelFromMessage(getProperty(message, "message"));
+    if (blocked === undefined) return;
+    const id = modelScopeId(blocked);
+    if (this.unavailableModelIds.has(id)) return;
+    this.unavailableModelIds.add(id);
+    const revision = ++this.modelScopeRevision;
+    this.events.publishGlobal({ type: "models.changed", revision });
+    void this.persistUnavailableModelIds().catch((error: unknown) => {
+      this.logModelAvailabilityWarning(error, "Could not persist unavailable model state");
+    });
+  }
+
+  private persistUnavailableModelIds(): Promise<void> {
+    const persist = async () => {
+      await this.loadUnavailableModelIds();
+      await this.modelAvailabilityStore.save(this.agentDir, [...this.unavailableModelIds].sort());
+    };
+    // Continue with a later write after a transient failure, but leave the
+    // failed promise visible to shutdown until a subsequent write succeeds.
+    const queued = this.unavailableModelIdsPersistence.then(persist, persist);
+    this.unavailableModelIdsPersistence = queued;
+    return queued;
+  }
+
+  private startUnavailableModelHistoryBackfill(): void {
+    const backfill = this.backfillUnavailableModelHistory();
+    this.unavailableModelHistoryBackfill = backfill;
+    void backfill.catch((error: unknown) => {
+      this.logModelAvailabilityWarning(error, "Could not backfill unavailable model history");
+    });
+  }
+
+  /**
+   * Recover guardrail observations from a bounded, newest-first transcript
+   * sample. It deliberately runs outside browser request paths: persisted
+   * state answers immediately, while an upgrade does not make opening a model
+   * picker wait for every historical transcript on disk.
+   */
+  private async backfillUnavailableModelHistory(): Promise<void> {
+    await this.loadUnavailableModelIds();
+    if (this.sessionManager.readBranch === undefined) return;
+    const entries = (await this.sessionManager.listAll())
+      .filter((entry) => entry.path !== "")
+      .sort((left, right) => right.modified.getTime() - left.modified.getTime())
+      .slice(0, MAX_MODEL_AVAILABILITY_HISTORY_SESSIONS);
+    let nextIndex = 0;
+    const worker = async (): Promise<void> => {
+      while (nextIndex < entries.length) {
+        const entry = entries[nextIndex++];
+        if (entry === undefined) return;
+        const branch = await this.sessionManager.readBranch?.(entry.path);
+        if (branch !== undefined && branch.length > 0) this.observeModelAvailabilityMessages(branch);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(MODEL_AVAILABILITY_HISTORY_CONCURRENCY, entries.length) }, worker));
+  }
+
+  /**
+   * Scan an opened session immediately. Empty or failed reads get a bounded
+   * retry window rather than a permanent "already scanned" marker, so a
+   * transcript written after startup can still teach the daemon the policy.
+   */
+  private async scanUnavailableModelHistory(ref: PiSessionRef, session: PiAgentSession): Promise<void> {
+    if (this.unavailableModelHistoryScanned.has(session)) return;
+    const retryAt = this.unavailableModelHistoryRetryAt.get(session);
+    if (retryAt !== undefined && retryAt > this.now().getTime()) return;
+    const inFlight = this.unavailableModelHistoryScans.get(session);
+    if (inFlight !== undefined) return inFlight;
+    const scan = (async () => {
+      try {
+        const branch = await this.readableSessionBranch(ref, session);
+        if (branch.length === 0) {
+          this.unavailableModelHistoryRetryAt.set(session, this.now().getTime() + MODEL_AVAILABILITY_HISTORY_RETRY_MS);
+          return;
+        }
+        this.observeModelAvailabilityMessages(branch);
+        this.unavailableModelHistoryScanned.add(session);
+        this.unavailableModelHistoryRetryAt.delete(session);
+      } catch (error: unknown) {
+        this.unavailableModelHistoryRetryAt.set(session, this.now().getTime() + MODEL_AVAILABILITY_HISTORY_RETRY_MS);
+        this.logModelAvailabilityWarning(error, "Could not scan unavailable model history for an opened session");
+      }
+    })();
+    this.unavailableModelHistoryScans.set(session, scan);
+    try {
+      await scan;
+    } finally {
+      if (this.unavailableModelHistoryScans.get(session) === scan) this.unavailableModelHistoryScans.delete(session);
+    }
+  }
+
+  private logModelAvailabilityWarning(error: unknown, message: string): void {
+    const details = { err: error };
+    if (this.logger.warn !== undefined) this.logger.warn(details, message);
+    else this.logger.info({ error: error instanceof Error ? error.message : String(error) }, message);
   }
 
   private runModelScopeMutation<T>(operation: () => Promise<T>): Promise<T> {
@@ -1740,11 +1901,12 @@ export class PiSessionService implements SessionRouteService {
   /** Persist one global enabled-model selection and publish its new revision. */
   private applyEnabledModelScope(
     session: PiAgentSession,
-    available: readonly AgentModel[],
+    runtimeAvailable: readonly AgentModel[],
+    policyAvailable: readonly AgentModel[],
     enabledIds: readonly string[] | null,
   ): void {
-    const availableIds = available.map(modelScopeId);
-    const persisted = persistedEnabledModelPatterns(enabledIds, availableIds);
+    const runtimeAvailableIds = runtimeAvailable.map(modelScopeId);
+    const persisted = persistedEnabledModelPatterns(enabledIds, runtimeAvailableIds);
     const nextState: ModelScopeSnapshot = {
       // Pi normalizes a scope covering the complete current catalog to an
       // omitted setting, which is the global canonical all-enabled state.
@@ -1753,11 +1915,11 @@ export class PiSessionService implements SessionRouteService {
     };
     session.settingsManager.setEnabledModels(persisted);
     this.modelScopeStates.set("global", nextState);
-    session.setScopedModels(scopedModelsFromEnabledIds(available, nextState.enabledIds, session.scopedModels));
+    session.setScopedModels(scopedModelsFromEnabledIds(policyAvailable, nextState.enabledIds, session.scopedModels));
     this.modelScopeCache.set(session, {
       scopeKey: "global",
       revision: nextState.revision,
-      catalogKey: available.map(modelScopeId).join("\0"),
+      catalogKey: policyAvailable.map(modelScopeId).join("\0"),
     });
     this.events.publishGlobal({ type: "models.changed", revision: nextState.revision });
   }
@@ -1778,7 +1940,40 @@ export class PiSessionService implements SessionRouteService {
       : candidates.find((candidate) => candidate.provider === parsed.provider && candidate.id === parsed.modelId)
         ?? session.modelRuntime.getModel(parsed.provider, parsed.modelId);
     if (model === undefined) throw unknownSpawnModelError(modelSpec);
+    if (this.unavailableModelIds.has(modelScopeId(model))) throw new Error(`Model unavailable: ${modelSpec}`);
     return model;
+  }
+
+  private async resolveSpawnModelInput(
+    spawningRef: PiSessionRef,
+    inheritedModel: AgentModel | undefined,
+    modelSpec: string | undefined,
+  ): Promise<AgentModel | undefined> {
+    if (modelSpec !== undefined) return this.resolveSpawnModel(spawningRef, modelSpec);
+    if (inheritedModel === undefined) return undefined;
+    await this.loadUnavailableModelIds();
+    if (this.unavailableModelIds.has(modelScopeId(inheritedModel))) {
+      throw new Error(`Model unavailable: ${modelSpecOf(inheritedModel)}`);
+    }
+    return inheritedModel;
+  }
+
+  /**
+   * Pi may apply a saved global default while constructing a new session. When
+   * that saved model was already proven guardrail-blocked, select an allowed
+   * model from the same scope (or fail before the session is exposed).
+   */
+  private async replaceBlockedInitialModel(session: PiAgentSession): Promise<void> {
+    const current = session.model;
+    if (current === undefined) return;
+    const available = await this.availableModelsAfterPolicy(session);
+    if (!this.unavailableModelIds.has(modelScopeId(current))) return;
+    const candidates = session.scopedModels.length > 0
+      ? session.scopedModels.map((scoped) => scoped.model).filter((model) => !this.unavailableModelIds.has(modelScopeId(model)))
+      : available;
+    const replacement = candidates[0];
+    if (replacement === undefined) throw new Error(`Model unavailable: ${modelSpecOf(current)}; no allowed model is available in this session's scope`);
+    await session.setModel(replacement);
   }
 
   /**
@@ -2410,8 +2605,9 @@ export class PiSessionService implements SessionRouteService {
       if (update.provider !== undefined && update.modelId !== undefined) {
         await session.modelRuntime.refresh({ allowNetwork: false });
         const target = `${update.provider}/${update.modelId}`;
+        const available = await this.availableModelsAfterPolicy(session);
         const enabledIds = await resolveEnabledModelIds({ settingsManager: settings, modelRuntime: session.modelRuntime, scopedModels: [] });
-        if (!session.modelRuntime.getAvailableSnapshot().some((model) => modelScopeId(model) === target)) {
+        if (!available.some((model) => modelScopeId(model) === target)) {
           throw new Error(`Model not found: ${target}`);
         }
         if (enabledIds !== null && !enabledIds.includes(target)) throw new Error(`Model is not enabled: ${target}`);
@@ -2443,6 +2639,39 @@ export class PiSessionService implements SessionRouteService {
   }
 
   /**
+   * Discard prior guardrail observations after an operator changes credentials
+   * or workspace policy. The next attempted selection is the authoritative
+   * recheck: a still-blocked model is learned and hidden again from its real
+   * provider response.
+   */
+  async recheckModelAvailability(ref: PiSessionRef): Promise<ClientSessionModelCatalogEntry[]> {
+    await this.assertWritable(ref);
+    const session = await this.getOrOpen(ref);
+    return this.runModelScopeMutation(async () => {
+      await this.scanUnavailableModelHistory(ref, session);
+      // If the daemon was started before this request, finish its bounded
+      // historical migration before clearing it so a late worker cannot put a
+      // deliberately rechecked model straight back into the denylist.
+      await this.unavailableModelHistoryBackfill;
+      await this.loadUnavailableModelIds();
+      if (this.unavailableModelIds.size > 0) {
+        const previousIds = [...this.unavailableModelIds];
+        this.unavailableModelIds.clear();
+        try {
+          await this.persistUnavailableModelIds();
+        } catch (error: unknown) {
+          for (const id of previousIds) this.unavailableModelIds.add(id);
+          throw error;
+        }
+        const revision = ++this.modelScopeRevision;
+        this.events.publishGlobal({ type: "models.changed", revision });
+      }
+      const scope = this.modelScopeContext(session);
+      return (await this.enabledModelCatalog(session)).map((entry) => catalogEntryToClientModel(entry, scope.editable));
+    });
+  }
+
+  /**
    * Add/remove one model to/from the global pi `enabledModels` scope. A
    * workspace `.pi/settings.json` override remains authoritative for that
    * workspace and is intentionally read-only in this picker.
@@ -2456,16 +2685,17 @@ export class PiSessionService implements SessionRouteService {
       this.assertTreeNavigationInactive(session, "change enabled models");
       await session.modelRuntime.refresh({ allowNetwork: false });
       const currentIds = (await this.modelScopeSnapshot(session, scope)).enabledIds;
-      const available = session.modelRuntime.getAvailableSnapshot();
-      const availableIds = available.map(modelScopeId);
+      const runtimeAvailable = session.modelRuntime.getAvailableSnapshot();
+      const policyAvailable = await this.availableModelsAfterPolicy(session);
+      const policyAvailableIds = policyAvailable.map(modelScopeId);
       const targetId = `${provider}/${modelId}`;
-      if (!availableIds.includes(targetId)) throw new Error(`Model not found: ${targetId}`);
+      if (!policyAvailableIds.includes(targetId)) throw new Error(`Model not found: ${targetId}`);
       if (!enabled && session.model !== undefined && modelScopeId(session.model) === targetId) {
         throw new Error("Current model cannot be disabled");
       }
-      const nextIds = applyEnabledModelToggle(currentIds, availableIds, targetId, enabled);
+      const nextIds = applyEnabledModelToggle(currentIds, runtimeAvailable.map(modelScopeId), targetId, enabled);
       this.assertTreeNavigationInactive(session, "change enabled models");
-      if (nextIds !== currentIds) this.applyEnabledModelScope(session, available, nextIds);
+      if (nextIds !== currentIds) this.applyEnabledModelScope(session, runtimeAvailable, policyAvailable, nextIds);
       // Respond from a fresh post-edit read so the response is exactly what
       // GET models/catalog returns after the edit, including pi's normalizations.
       return (await this.enabledModelCatalog(session)).map((entry) => catalogEntryToClientModel(entry));
@@ -2481,18 +2711,19 @@ export class PiSessionService implements SessionRouteService {
       if (scope.source !== "global") throw new Error("Model availability is controlled by this workspace's .pi/settings.json");
       this.assertTreeNavigationInactive(session, "change enabled models");
       await session.modelRuntime.refresh({ allowNetwork: false });
-      const available = session.modelRuntime.getAvailableSnapshot();
-      const availableIds = available.map(modelScopeId);
+      const runtimeAvailable = session.modelRuntime.getAvailableSnapshot();
+      const policyAvailable = await this.availableModelsAfterPolicy(session);
+      const policyAvailableIds = policyAvailable.map(modelScopeId);
       let nextIds: readonly string[] | null = null;
       if (mode === "current") {
         const current = session.model;
-        if (current === undefined || !availableIds.includes(modelScopeId(current))) {
+        if (current === undefined || !policyAvailableIds.includes(modelScopeId(current))) {
           throw new Error("Current model is unavailable");
         }
         nextIds = [modelScopeId(current)];
       }
       this.assertTreeNavigationInactive(session, "change enabled models");
-      this.applyEnabledModelScope(session, available, nextIds);
+      this.applyEnabledModelScope(session, runtimeAvailable, policyAvailable, nextIds);
       return (await this.enabledModelCatalog(session)).map((entry) => catalogEntryToClientModel(entry));
     });
   }
@@ -2506,6 +2737,7 @@ export class PiSessionService implements SessionRouteService {
     const model = candidates.find((candidate) => candidate.provider === provider && candidate.id === modelId)
       ?? session.modelRuntime.getModel(provider, modelId);
     if (model === undefined) throw new Error(`Model not found: ${provider}/${modelId}`);
+    if (this.unavailableModelIds.has(modelScopeId(model))) throw new Error(`Model unavailable: ${provider}/${modelId}`);
     await this.runSessionEntryMutation(session, "change models", () => session.setModel(model));
     this.publishActivity(session, `model: ${model.id}`, "idle", model.provider);
     this.publishStatus(session);
@@ -2517,8 +2749,23 @@ export class PiSessionService implements SessionRouteService {
     const session = await this.getOrOpen(ref);
     const result = await this.runModelScopeMutation(async () => {
       await session.modelRuntime.refresh({ allowNetwork: false });
-      await this.synchronizeSessionModelScope(session, session.modelRuntime.getAvailableSnapshot());
-      return this.runSessionEntryMutation(session, "change models", () => session.cycleModel(direction));
+      const available = await this.availableModelsAfterPolicy(session);
+      await this.synchronizeSessionModelScope(session, available);
+      const enabledIds = (await this.modelScopeSnapshot(session)).enabledIds;
+      if (enabledIds !== null) {
+        return this.runSessionEntryMutation(session, "change models", () => session.cycleModel(direction));
+      }
+      // Pi interprets an empty scopedModels array as its raw runtime catalog.
+      // That raw catalog intentionally includes models denied by an OpenRouter
+      // workspace guardrail, so temporarily project the policy-filtered "all"
+      // scope for this one cycle and then restore Pi's unscoped representation.
+      const priorScopedModels = [...session.scopedModels];
+      session.setScopedModels(available.map((model) => ({ model })));
+      try {
+        return await this.runSessionEntryMutation(session, "change models", () => session.cycleModel(direction));
+      } finally {
+        session.setScopedModels(priorScopedModels);
+      }
     });
     if (result === undefined) throw new Error(session.scopedModels.length > 0 ? "Only one model in scope" : "Only one model available");
     this.publishActivity(session, `model: ${result.model.id}`, "idle", result.model.provider);
@@ -3664,6 +3911,7 @@ export class PiSessionService implements SessionRouteService {
       ...(options.initialModel === undefined ? {} : { initialModel: options.initialModel }),
       ...(options.initialThinkingLevel === undefined ? {} : { initialThinkingLevel: options.initialThinkingLevel }),
     });
+    await this.replaceBlockedInitialModel(runtime.session);
     const active: ActiveSession<PiSessionRuntime> = { runtime, unsubscribe: noop };
     let boundSession = runtime.session;
     const startupSignal = options.startupSignal;
@@ -4024,6 +4272,7 @@ export class PiSessionService implements SessionRouteService {
       }
     }
     const unsubscribe = session.subscribe((event) => {
+      if (getString(event, "type") === "message_end") this.observeModelAvailabilityMessage(getProperty(event, "message"));
       this.events.publish(session.sessionId, toClientEvent(event, session.thinkingLevel));
       this.publishActivityForEvent(session, event);
       const eventType = getString(event, "type");

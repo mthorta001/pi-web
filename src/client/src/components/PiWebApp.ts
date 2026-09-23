@@ -3236,6 +3236,30 @@ export class PiWebApp extends LitElement {
     }
   };
 
+  private readonly handleRecheckModelAvailability = async (): Promise<void> => {
+    const dialog = this.currentModelDialog();
+    if (dialog === undefined) return;
+    this.modelDialogMutationInFlight += 1;
+    try {
+      const catalog = await this.sessions.recheckModelAvailability();
+      if (catalog !== undefined) this.clearUnavailableModelsForMachine(dialog.origin.machineId);
+      this.applyModelDialogCatalog(dialog, catalog);
+    } finally {
+      this.modelDialogMutationInFlight -= 1;
+      if (this.modelDialogMutationInFlight === 0 && this.modelDialogRefreshPending) {
+        this.modelDialogRefreshPending = false;
+        void this.refreshOpenModelDialog();
+      }
+    }
+  };
+
+  private clearUnavailableModelsForMachine(machineId: string): void {
+    const prefix = `${machineId}\u0000`;
+    const retained = [...this.unavailableModelKeys].filter((key) => !key.startsWith(prefix));
+    if (retained.length === this.unavailableModelKeys.size) return;
+    this.unavailableModelKeys = new Set(retained);
+  }
+
   private currentModelDialog(): NonNullable<AppState["modelDialog"]> | undefined {
     const dialog = this.state.modelDialog;
     if (dialog !== undefined && this.modelDialogOriginIsCurrent(dialog.origin)) return dialog;
@@ -3386,7 +3410,7 @@ export class PiWebApp extends LitElement {
             <prompt-editor .shortcuts=${this.shortcutConfig} .sessionId=${state.selectedSession.id} .cwd=${state.selectedWorkspace?.path} .machineId=${selectedMachineId(state)} .unavailableModelKeys=${this.unavailableModelKeys} .projectId=${state.selectedWorkspace?.projectId} .workspaceId=${state.selectedWorkspace?.id} .attachmentsFolder=${workspaceEffectiveAttachmentsFolder(state.selectedWorkspace?.effectiveConfig, this.workspaceAttachmentsDefaultFolder)} .disabled=${state.selectedSession.archived === true} .canSteer=${state.status?.isStreaming === true} .isCompacting=${state.status?.isCompacting === true} .canStop=${state.status?.isStreaming === true || state.status?.isBashRunning === true || state.status?.isCompacting === true || (state.status?.pendingMessageCount ?? 0) > 0} .status=${state.status} .availableThinkingLevels=${state.availableThinkingLevels} .sending=${state.sendingPrompts[state.selectedSession.id] === true} .onSend=${this.handleSendPrompt} .onStop=${this.handleStopActiveWork} .onSelectModel=${this.handleSelectModel} .onSelectThinking=${this.handleSelectThinking}></prompt-editor>
             ${this.renderStatusBar(state)}
             ${state.commandDialog !== undefined ? html`<command-picker .title=${state.commandDialog.title} .options=${state.commandDialog.options} .onPick=${(value: string) => this.sessions.respondToCommand(state.commandDialog?.requestId ?? "", value)} .onCancel=${() => { this.sessions.cancelCommand(); }}></command-picker>` : null}
-            ${state.modelDialog !== undefined ? html`<model-picker title=${state.modelDialog.title} .options=${state.modelDialog.options} .catalog=${state.modelDialog.catalog} .unavailableModelKeys=${this.unavailableModelKeys} .modelAvailabilityMachineId=${selectedMachineId(state)} .defaultValue=${state.modelDialog.defaultValue} .defaultsLoading=${state.modelDialog.defaultsLoading === true} .onSetDefault=${this.handleSetDefaultModel} .selectedValue=${state.modelDialog.selectedValue} .onPick=${(value: string) => { void this.pickModel(value); }} .onToggleEnabled=${this.handleToggleModelEnabled} .onSetScope=${this.handleSetModelScope} .onCancel=${() => { this.setState({ modelDialog: undefined }); }}></model-picker>` : null}
+            ${state.modelDialog !== undefined ? html`<model-picker title=${state.modelDialog.title} .options=${state.modelDialog.options} .catalog=${state.modelDialog.catalog} .unavailableModelKeys=${this.unavailableModelKeys} .modelAvailabilityMachineId=${selectedMachineId(state)} .defaultValue=${state.modelDialog.defaultValue} .defaultsLoading=${state.modelDialog.defaultsLoading === true} .onSetDefault=${this.handleSetDefaultModel} .selectedValue=${state.modelDialog.selectedValue} .onPick=${(value: string) => { void this.pickModel(value); }} .onToggleEnabled=${this.handleToggleModelEnabled} .onSetScope=${this.handleSetModelScope} .onRecheckAvailability=${this.handleRecheckModelAvailability} .onCancel=${() => { this.setState({ modelDialog: undefined }); }}></model-picker>` : null}
             ${state.thinkingDialog !== undefined ? html`<command-picker title=${state.thinkingDialog.title} .options=${state.thinkingDialog.options} .defaultValue=${state.thinkingDialog.defaultValue} .defaultsLoading=${state.thinkingDialog.defaultsLoading === true} .onSetDefault=${this.handleSetDefaultThinking} .selectedValue=${state.thinkingDialog.selectedValue} .onPick=${(value: string) => { void this.pickThinking(value); }} .onCancel=${() => { this.setState({ thinkingDialog: undefined }); }}></command-picker>` : null}
           ` : html`<div class="empty">${this.sessionEmptyMessage()}</div>`}
         </main>
