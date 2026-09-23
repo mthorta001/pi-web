@@ -774,6 +774,27 @@ describe("session routes", () => {
     }
   });
 
+  it("forwards a model policy recheck and returns the refreshed catalog", async () => {
+    const routeApp = Fastify({ logger: false });
+    await routeApp.register(fastifyWebsocket);
+    const eventHub = new SessionEventHub();
+    const routeService = new CapturingRouteSessionService();
+    routeService.recheckModelAvailabilityResponse = [{ provider: "anthropic", id: "claude-opus-4-6", enabled: true }];
+    registerSessionRoutes(routeApp, routeService, eventHub);
+
+    try {
+      const requestCwd = resolve("/repo");
+      const response = await routeApp.inject({ method: "POST", url: "/sessions/session-1/models/recheck", payload: { cwd: requestCwd } });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ models: routeService.recheckModelAvailabilityResponse });
+      expect(routeService.recheckModelAvailabilityCalls).toEqual([{ id: "session-1", cwd: requestCwd }]);
+    } finally {
+      await routeService.dispose();
+      await routeApp.close();
+    }
+  });
+
   it("forwards atomic model-scope presets and returns the updated catalog", async () => {
     const routeApp = Fastify({ logger: false });
     await routeApp.register(fastifyWebsocket);
@@ -1431,6 +1452,12 @@ class CapturingRouteSessionService implements SessionRouteService {
     this.modelCatalogCalls.push(lookup);
     if (this.modelCatalogError !== undefined) return Promise.reject(this.modelCatalogError);
     return Promise.resolve(this.modelCatalogResponse);
+  }
+  recheckModelAvailabilityCalls: SessionRouteRef[] = [];
+  recheckModelAvailabilityResponse: SessionModelCatalogEntry[] = [];
+  recheckModelAvailability(lookup: SessionRouteRef): Promise<SessionModelCatalogEntry[]> {
+    this.recheckModelAvailabilityCalls.push(lookup);
+    return Promise.resolve(this.recheckModelAvailabilityResponse);
   }
   setModelEnabledCalls: { lookup: SessionRouteRef; provider: string; modelId: string; enabled: boolean }[] = [];
   setModelEnabledResponse: SessionModelCatalogEntry[] = [];

@@ -132,6 +132,7 @@ export const FEDERATED_HTTP_ROUTES = [
   { method: "GET", path: "/sessions/:sessionId/stream-snapshot" },
   { method: "GET", path: "/sessions/:sessionId/models" },
   { method: "GET", path: "/sessions/:sessionId/models/catalog" },
+  { method: "POST", path: "/sessions/:sessionId/models/recheck" },
   { method: "POST", path: "/sessions/:sessionId/models/enabled" },
   { method: "POST", path: "/sessions/:sessionId/models/scope" },
   { method: "POST", path: "/sessions/:sessionId/model" },

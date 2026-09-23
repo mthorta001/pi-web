@@ -80,6 +80,22 @@ describe("SessionController model catalog", () => {
     expect(Object.values(state.browserErrors).map((error) => error.message)).toContain("Error: catalog failed");
   });
 
+  it("rechecks learned guardrail denials on the selected machine", async () => {
+    const calls: { sessionId: string; machineId: string }[] = [];
+    let state: AppState = { ...initialAppState(), selectedMachine: machine("remote-a"), selectedWorkspace: workspace, selectedSession: oldSession, sessions: [oldSession] };
+    const api: typeof defaultApi = {
+      ...defaultApi,
+      recheckModelAvailability: (session, machineId) => {
+        calls.push({ sessionId: sessionLookupId(session), machineId: machineId ?? "local" });
+        return Promise.resolve({ models: catalogModels });
+      },
+    };
+    const controller = controllerWithApi(state, (patch) => { state = { ...state, ...patch }; }, api);
+
+    await expect(controller.recheckModelAvailability()).resolves.toEqual(catalogModels);
+    expect(calls).toEqual([{ sessionId: oldSession.id, machineId: "remote-a" }]);
+  });
+
   it("toggles one model's membership and returns the fresh catalog", async () => {
     const calls: { provider: string; modelId: string; enabled: boolean; machineId: string }[] = [];
     let state: AppState = { ...initialAppState(), selectedMachine: machine("remote-a"), selectedWorkspace: workspace, selectedSession: oldSession, sessions: [oldSession] };

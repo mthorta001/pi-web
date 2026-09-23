@@ -1,7 +1,11 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { PiSessionService, type PiAgentSession } from "./piSessionService.js";
 import type { SpawnTargetDecision } from "./spawnTargetResolver.js";
 import { CapturingSessionEventHub, fakeRuntime, fakeSessionManager, runtimeCreator, sessionGateway, testModel, testModelRuntime, type RuntimeCreator } from "./piSessionService.testSupport.js";
+import { FileModelAvailabilityStore } from "./modelAvailabilityStore.js";
 
 const TEST_AGENT_DIR = "/tmp/pi-web-test-agent";
 const TEST_MODEL_SPEC = "anthropic/claude-sonnet-4-5-20250929";
@@ -59,6 +63,37 @@ describe("PiSessionService", () => {
       expect(initialModel).toBe(model);
       expect(delegationToolsEnabled).toBe(true);
       await service.dispose();
+    });
+
+    it("rejects an inherited model already blocked by a workspace guardrail", async () => {
+      const root = await mkdtemp(join(tmpdir(), "pi-web-spawn-model-availability-"));
+      const agentDir = join(root, "agent");
+      const model = testModel();
+      const store = new FileModelAvailabilityStore(join(root, "data", "model-availability.json"));
+      await store.save(agentDir, [`${model.provider}/${model.id}`]);
+      const fake = fakeRuntime("spawned-1", { sessionFile: "/tmp/spawned-1.jsonl", sessionManager: fakeSessionManager("/workspace-feature") });
+      const service = new PiSessionService(new CapturingSessionEventHub(), {
+        agentDir,
+        modelRuntime: testModelRuntime,
+        createAgentRuntime: runtimeCreator(fake.runtime),
+        sessionManager: sessionGateway([]),
+        spawnTargets: { resolveSpawnTarget: () => Promise.resolve({ allowed: true, cwd: "/workspace-feature" }) },
+        heartbeatIntervalMs: 60_000,
+        modelAvailabilityStore: store,
+      });
+      try {
+        await expect(service.spawnSession({
+          spawningCwd: "/workspace",
+          spawningSessionId: "spawner-1",
+          prompt: "continue",
+          cwd: "/workspace-feature",
+          model,
+        })).rejects.toThrow(`Model unavailable: ${model.provider}/${model.id}`);
+        expect(fake.calls.prompt).toEqual([]);
+      } finally {
+        await service.dispose();
+        await rm(root, { recursive: true, force: true });
+      }
     });
 
     it("passes the dispatching session's thinking level to the spawned session's runtime", async () => {

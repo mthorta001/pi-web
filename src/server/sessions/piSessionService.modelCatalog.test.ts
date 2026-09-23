@@ -6,6 +6,7 @@ import { ModelRuntime, ProjectTrustStore, SessionManager } from "@earendil-works
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { PiSessionService } from "./piSessionService.js";
 import { CapturingSessionEventHub, sessionGateway } from "./piSessionService.testSupport.js";
+import { FileModelAvailabilityStore } from "./modelAvailabilityStore.js";
 
 const PROVIDER = "anthropic";
 const FIRST_MODEL = "claude-opus-4-6";
@@ -30,7 +31,10 @@ interface StartedSession {
   agentDir: string;
 }
 
-async function startSessionWithSettings(settings: Record<string, unknown> | undefined): Promise<StartedSession> {
+async function startSessionWithSettings(
+  settings: Record<string, unknown> | undefined,
+  guardrailBlockedModelIds: readonly string[] = [],
+): Promise<StartedSession> {
   const root = await mkdtemp(join(tmpdir(), "pi-web-model-catalog-"));
   tempDirs.push(root);
   const agentDir = join(root, "agent");
@@ -40,6 +44,8 @@ async function startSessionWithSettings(settings: Record<string, unknown> | unde
   if (settings !== undefined) {
     await writeFile(join(agentDir, "settings.json"), JSON.stringify(settings));
   }
+  const modelAvailabilityStore = new FileModelAvailabilityStore(join(root, "data", "model-availability.json"));
+  if (guardrailBlockedModelIds.length > 0) await modelAvailabilityStore.save(agentDir, guardrailBlockedModelIds);
   const gateway = sessionGateway([]);
   gateway.create = (cwd) => SessionManager.inMemory(cwd);
   const service = new PiSessionService(new CapturingSessionEventHub(), {
@@ -47,6 +53,7 @@ async function startSessionWithSettings(settings: Record<string, unknown> | unde
     modelRuntime,
     sessionManager: gateway,
     heartbeatIntervalMs: 60_000,
+    modelAvailabilityStore,
   });
   try {
     const created = await service.start(workspace);
@@ -187,6 +194,77 @@ describe("PiSessionService model catalog", () => {
       await expectPersistedEnabledModels(agentDir, remainingIds);
       // The live scope follows immediately: the pickable models exclude the disabled one.
       expect(catalogIds((await service.availableModels(ref)).map((model) => ({ provider: model.provider ?? "", id: model.id ?? "" })))).toEqual(remainingIds);
+    } finally {
+      await service.dispose();
+    }
+  });
+
+  it("keeps a guardrail-blocked model enabled in Pi settings when editing an unscoped catalog", async () => {
+    const blocked = modelRuntime.getAvailableSnapshot()[0];
+    if (blocked === undefined) throw new Error("expected a blocked fixture model");
+    const blockedId = `${blocked.provider}/${blocked.id}`;
+    const { service, ref, agentDir } = await startSessionWithSettings(undefined, [blockedId]);
+    try {
+      const catalog = await service.modelCatalog(ref);
+      expect(catalogIds(catalog)).not.toContain(blockedId);
+      const current = (await service.status(ref)).model;
+      const currentId = current?.provider === undefined || current.id === undefined ? undefined : `${current.provider}/${current.id}`;
+      const target = catalog.find((entry) => `${entry.provider}/${entry.id}` !== currentId);
+      if (target === undefined) throw new Error("expected an allowed model that is not current");
+
+      await service.setModelEnabled(ref, target.provider, target.id, false);
+
+      const expectedEnabledIds = modelRuntime.getAvailableSnapshot()
+        .map((model) => `${model.provider}/${model.id}`)
+        .filter((id) => id !== `${target.provider}/${target.id}`);
+      expect(expectedEnabledIds).toContain(blockedId);
+      await expectPersistedEnabledModels(agentDir, expectedEnabledIds);
+    } finally {
+      await service.dispose();
+    }
+  });
+
+  it("cycles only policy-allowed models while Pi has no explicit enabled-model scope", async () => {
+    const [current, blocked] = modelRuntime.getAvailableSnapshot();
+    if (current === undefined || blocked === undefined) throw new Error("expected multiple fixture models");
+    const blockedId = `${blocked.provider}/${blocked.id}`;
+    const { service, ref } = await startSessionWithSettings(undefined, [blockedId]);
+    try {
+      await service.setModel(ref, current.provider, current.id);
+
+      const cycled = await service.cycleModel(ref, "forward");
+
+      expect(cycled.model).not.toMatchObject({ provider: blocked.provider, id: blocked.id });
+    } finally {
+      await service.dispose();
+    }
+  });
+
+  it("replaces a saved default already known to be guardrail-blocked before exposing a new session", async () => {
+    const blocked = modelRuntime.getAvailableSnapshot()[0];
+    if (blocked === undefined) throw new Error("expected a blocked fixture model");
+    const blockedId = `${blocked.provider}/${blocked.id}`;
+    const { service, ref } = await startSessionWithSettings({
+      defaultProvider: blocked.provider,
+      defaultModel: blocked.id,
+      }, [blockedId]);
+    try {
+      const status = await service.status(ref);
+      expect(status.model).not.toMatchObject({ provider: blocked.provider, id: blocked.id });
+    } finally {
+      await service.dispose();
+    }
+  });
+
+  it("rechecks policy state explicitly after a credentials or guardrail change", async () => {
+    const blocked = modelRuntime.getAvailableSnapshot()[0];
+    if (blocked === undefined) throw new Error("expected a blocked fixture model");
+    const blockedId = `${blocked.provider}/${blocked.id}`;
+    const { service, ref } = await startSessionWithSettings(undefined, [blockedId]);
+    try {
+      expect(catalogIds(await service.modelCatalog(ref))).not.toContain(blockedId);
+
+      expect(catalogIds(await service.recheckModelAvailability(ref))).toContain(blockedId);
     } finally {
       await service.dispose();
     }

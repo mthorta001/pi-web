@@ -1017,6 +1017,21 @@ export class SessionController {
     }
   }
 
+  /** Clear learned workspace-policy denials after a credentials or guardrail change. */
+  async recheckModelAvailability(): Promise<SessionModelCatalogEntry[] | undefined> {
+    const state = this.getState();
+    const session = state.selectedSession;
+    if (!session || session.archived === true) return undefined;
+    const machineId = selectedMachineId(state);
+    const errorOwner = this.captureSessionErrorOwner(session);
+    try {
+      return (await this.api.recheckModelAvailability(session, machineId)).models;
+    } catch (error) {
+      this.reportSessionError(session, machineId, error, errorOwner);
+      return undefined;
+    }
+  }
+
   /**
    * Toggle one model's membership in pi's enabled-models scope. Returns the
    * updated catalog on success and `undefined` on failure, so the caller can

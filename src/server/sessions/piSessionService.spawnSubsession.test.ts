@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { PiSessionService, type PiAgentSession } from "./piSessionService.js";
 import type { SpawnTargetDecision } from "./spawnTargetResolver.js";
 import { CapturingSessionEventHub, emptyArchiveStore, fakeRuntime, fakeSessionManager, resolveSessionFileFromList, runtimeCreator, sessionGateway, sessionRecord, sessionRef, testModel, testModelRuntime, type RuntimeCreator } from "./piSessionService.testSupport.js";
+import { FileModelAvailabilityStore } from "./modelAvailabilityStore.js";
 
 const TEST_AGENT_DIR = "/tmp/pi-web-test-agent";
 
@@ -124,6 +125,42 @@ describe("PiSessionService", () => {
       await expect(service.spawnSubsession({ spawningCwd: "/workspace", parentSessionId: "parent-1", parentSessionFile: "/tmp/parent-1.jsonl", prompt: "do the slice" }))
         .rejects.toThrow("Spawning session is not in a registered project");
       await service.dispose();
+    });
+
+    it("rejects a guardrail-blocked inherited model before creating a tracked child", async () => {
+      const root = await mkdtemp(join(tmpdir(), "pi-web-subsession-model-availability-"));
+      const agentDir = join(root, "agent");
+      const model = testModel();
+      const store = new FileModelAvailabilityStore(join(root, "data", "model-availability.json"));
+      await store.save(agentDir, [`${model.provider}/${model.id}`]);
+      const parent = fakeRuntime("parent-1", { sessionFile: "/tmp/parent-1.jsonl" });
+      const child = fakeRuntime("child-1", { sessionFile: "/tmp/child-1.jsonl", sessionManager: fakeSessionManager("/workspace") });
+      const runtimes = [parent.runtime, child.runtime];
+      let index = 0;
+      const service = new PiSessionService(new CapturingSessionEventHub(), {
+        agentDir,
+        modelRuntime: testModelRuntime,
+        createAgentRuntime: () => Promise.resolve(runtimes[index++] ?? child.runtime),
+        sessionManager: sessionGateway([]),
+        archiveStore: emptyArchiveStore(),
+        spawnTargets: { resolveSpawnTarget: () => Promise.resolve({ allowed: true, cwd: "/workspace" }) },
+        heartbeatIntervalMs: 60_000,
+        modelAvailabilityStore: store,
+      });
+      try {
+        await service.start("/workspace");
+        await expect(service.spawnSubsession({
+          spawningCwd: "/workspace",
+          parentSessionId: "parent-1",
+          parentSessionFile: "/tmp/parent-1.jsonl",
+          prompt: "do the slice",
+          model,
+        })).rejects.toThrow(`Model unavailable: ${model.provider}/${model.id}`);
+        expect(child.calls.prompt).toEqual([]);
+      } finally {
+        await service.dispose();
+        await rm(root, { recursive: true, force: true });
+      }
     });
 
     it("uses the parent model and thinking level and disables delegation before creating the tracked child runtime", async () => {

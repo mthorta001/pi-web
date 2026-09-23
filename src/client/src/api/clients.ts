@@ -257,6 +257,7 @@ export const sessionsApi = {
   cancelDialog: (session: SessionRef, dialogId: string, machineId = "local") => request(sessionPath(session, "dialogs/cancel", machineId), parseExtensionDialogCloseResponse, { method: "POST", body: sessionBody(session, { dialogId }) }),
   models: (session: SessionRef, machineId = "local") => request(sessionQueryPath(session, "models", machineId), parseModelSelectionResponse),
   modelCatalog: (session: SessionRef, machineId = "local") => request(sessionQueryPath(session, "models/catalog", machineId), parseSessionModelCatalogResponse),
+  recheckModelAvailability: (session: SessionRef, machineId = "local") => request(sessionPath(session, "models/recheck", machineId), parseSessionModelCatalogResponse, { method: "POST", body: sessionBody(session) }),
   setModelEnabled: (session: SessionRef, provider: string, modelId: string, enabled: boolean, machineId = "local") => request(sessionPath(session, "models/enabled", machineId), parseSessionModelCatalogResponse, { method: "POST", body: sessionBody(session, { provider, modelId, enabled }) }),
   setModelScope: (session: SessionRef, mode: SessionModelScopeMode, machineId = "local") => request(sessionPath(session, "models/scope", machineId), parseSessionModelCatalogResponse, { method: "POST", body: sessionBody(session, { mode }) }),
   setModel: (session: SessionRef, provider: string, modelId: string, machineId = "local") => request(sessionPath(session, "model", machineId), parseSessionStatus, { method: "POST", body: sessionBody(session, { provider, modelId }) }),

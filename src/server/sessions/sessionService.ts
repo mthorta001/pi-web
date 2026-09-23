@@ -75,6 +75,8 @@ export interface SessionRouteService {
   availableModels(ref: SessionRouteRef): Promise<ClientSessionModel[]>;
   /** The session machine's full available-model catalog with per-model enabled state, enabled models first. */
   modelCatalog(ref: SessionRouteRef): Promise<ClientSessionModelCatalogEntry[]>;
+  /** Clear learned workspace-policy denials and return the refreshed model catalog. */
+  recheckModelAvailability(ref: SessionRouteRef): Promise<ClientSessionModelCatalogEntry[]>;
   setModel(ref: SessionRouteRef, provider: string, modelId: string): Promise<ClientSessionStatus>;
   /** Add/remove one model to/from pi's enabled-models scope; returns the updated full catalog. */
   setModelEnabled(ref: SessionRouteRef, provider: string, modelId: string, enabled: boolean): Promise<ClientSessionModelCatalogEntry[]>;

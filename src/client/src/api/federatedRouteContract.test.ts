@@ -151,6 +151,7 @@ describe("federated route contract", () => {
     expect(FEDERATED_HTTP_ROUTES.filter((route) => route.path.includes("/models"))).toEqual([
       { method: "GET", path: "/sessions/:sessionId/models" },
       { method: "GET", path: "/sessions/:sessionId/models/catalog" },
+      { method: "POST", path: "/sessions/:sessionId/models/recheck" },
       { method: "POST", path: "/sessions/:sessionId/models/enabled" },
       { method: "POST", path: "/sessions/:sessionId/models/scope" },
     ]);
@@ -209,6 +210,7 @@ describe("federated route contract", () => {
       ignoreParseFailure(sessionsApi.cancelDialog(session, "dialog 1", machineId)),
       ignoreParseFailure(sessionsApi.models(session, machineId)),
       ignoreParseFailure(sessionsApi.modelCatalog(session, machineId)),
+      ignoreParseFailure(sessionsApi.recheckModelAvailability(session, machineId)),
       ignoreParseFailure(sessionsApi.setModelEnabled(session, "openai", "gpt", true, machineId)),
       ignoreParseFailure(sessionsApi.setModelScope(session, "current", machineId)),
       ignoreParseFailure(sessionsApi.setModel(session, "openai", "gpt", machineId)),
