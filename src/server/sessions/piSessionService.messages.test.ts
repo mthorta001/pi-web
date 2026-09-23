@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { PiSessionService } from "./piSessionService.js";
-import { CapturingSessionEventHub, fakeRuntime, fakeSessionManager, runtimeCreator, sessionGateway, sessionRecord, sessionRef, testModelRuntime } from "./piSessionService.testSupport.js";
+import { CapturingSessionEventHub, fakeRuntime, fakeSessionManager, runtimeCreator, sessionGateway, sessionRecord, sessionRef, testModel, testModelRuntime } from "./piSessionService.testSupport.js";
 
 const TEST_AGENT_DIR = "/tmp/pi-web-test-agent";
 
@@ -88,6 +88,37 @@ describe("PiSessionService", () => {
         thinkingLevel: "xhigh",
       });
       await service.dispose();
+    });
+
+    it("removes a guardrail-blocked model from the backend catalog", async () => {
+      const ref = sessionRef("session-1");
+      const target = testModel();
+      const availableSnapshot = vi.spyOn(testModelRuntime, "getAvailableSnapshot").mockReturnValue([target]);
+      const modelService = messagesService([]);
+      try {
+        await modelService.service.status(ref);
+
+        expect((await modelService.service.availableModels(ref)).some((model) => model.provider === target.provider && model.id === target.id)).toBe(true);
+
+        modelService.fake.emit({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            stopReason: "error",
+            provider: target.provider,
+            model: target.id,
+            errorMessage: '404: {"message":"0 endpoints out of 2 requested are available matching your guardrail restrictions and data policy","code":404,"metadata":{"ineligibility_reasons":[{"reason":"model-ignored-by-guardrail"}]}}',
+          },
+        });
+
+        expect((await modelService.service.availableModels(ref)).some((model) => model.provider === target.provider && model.id === target.id)).toBe(false);
+        expect((await modelService.service.modelCatalog(ref)).some((model) => model.provider === target.provider && model.id === target.id)).toBe(false);
+        await expect(modelService.service.setModel(ref, target.provider, target.id)).rejects.toThrow("Model unavailable");
+        expect(modelService.events.globalEvents).toContainEqual({ type: "models.changed", revision: 1 });
+      } finally {
+        await modelService.service.dispose();
+        availableSnapshot.mockRestore();
+      }
     });
   });
 });
