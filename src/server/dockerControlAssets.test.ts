@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { copyFile, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -98,6 +98,54 @@ describe("Docker command assets", () => {
     expect(devCompose).not.toContain("COMPOSE_PROJECT_NAME:");
     expect(devCompose).toContain("/usr/local/sbin/pi-web-dev-sync-node-modules");
     expect(devCompose.match(/volumes: \*pi-web-dev-volumes/g)).toHaveLength(3);
+  });
+
+  dockerCommandIt("mounts the configured host skills directory read-only at its source and Pi's global path", async () => {
+    const skillsDir = join(tempDir, "host home", ".agents", "skills");
+    const overrideFile = join(tempDir, "skills-compose.override.yml");
+    await mkdir(skillsDir, { recursive: true });
+    const resolvedSkillsDir = await realpath(skillsDir);
+
+    const script = [
+      `. ${shellSingleQuote(join(repoRoot, "docker", "internal", "host-profile.sh"))}`,
+      `pi_web_docker_host_write_compose_override ${shellSingleQuote(overrideFile)} mac-podman-desktop '' '' ${shellSingleQuote(skillsDir)}`,
+    ].join("\n");
+    await execUtf8("sh", ["-c", script], cleanProcessEnv());
+
+    const override = await readFile(overrideFile, "utf8");
+    const quotedSkillsDir = `'${resolvedSkillsDir.replaceAll("'", "''")}'`;
+    expect(override).toContain(`source: ${quotedSkillsDir}\n    target: ${quotedSkillsDir}\n    read_only: true`);
+    expect(override).toContain(`source: ${quotedSkillsDir}\n    target: '/data/home/.agents/skills'\n    read_only: true`);
+    expect(override.match(/read_only: true/g)).toHaveLength(2);
+  });
+
+  dockerCommandIt("rejects a configured skills path that is not an existing skills directory", async () => {
+    const overrideFile = join(tempDir, "invalid-skills-compose.override.yml");
+    const script = [
+      `. ${shellSingleQuote(join(repoRoot, "docker", "internal", "host-profile.sh"))}`,
+      `pi_web_docker_host_write_compose_override ${shellSingleQuote(overrideFile)} mac-podman-desktop '' '' ${shellSingleQuote(join(tempDir, "missing"))}`,
+    ].join("\n");
+
+    const result = await execUtf8AllowFailure("sh", ["-c", script], cleanProcessEnv());
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("PI_WEB_DOCKER_SKILLS_DIR must be an existing directory");
+  });
+
+  dockerCommandIt("rejects writable extra mounts inside the configured skills directory", async () => {
+    const skillsDir = join(tempDir, "host", ".agents", "skills");
+    const nestedSkillDir = join(skillsDir, "example-skill");
+    const overrideFile = join(tempDir, "overlapping-skills-compose.override.yml");
+    await mkdir(nestedSkillDir, { recursive: true });
+
+    const script = [
+      `. ${shellSingleQuote(join(repoRoot, "docker", "internal", "host-profile.sh"))}`,
+      `pi_web_docker_host_write_compose_override ${shellSingleQuote(overrideFile)} mac-podman-desktop ${shellSingleQuote(nestedSkillDir)} '' ${shellSingleQuote(skillsDir)}`,
+    ].join("\n");
+    const result = await execUtf8AllowFailure("sh", ["-c", script], cleanProcessEnv());
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("must not add a writable mount at or below PI_WEB_DOCKER_SKILLS_DIR");
   });
 
   it("starts development web after data init and sessiond only after web health", async () => {
@@ -587,6 +635,9 @@ describe("Docker command assets", () => {
   dockerCommandIt("starts restart-sessiond in a detached Docker helper", async () => {
     const installDir = await createRuntimeInstall();
     const fakeDocker = await installFakeDocker();
+    const skillsDir = join(tempDir, "helper-home", ".agents", "skills");
+    await mkdir(skillsDir, { recursive: true });
+    await writeFile(join(installDir, ".env"), `PI_WEB_DOCKER_SKILLS_DIR=${skillsDir}\n`, { flag: "a" });
 
     const result = await runDockerCommand(["restart-sessiond"], runtimeEnv(fakeDocker, installDir));
 
@@ -604,6 +655,7 @@ describe("Docker command assets", () => {
     expect(log).toContain("--user 1234:2345");
     expect(log).toContain(`PI_WEB_DOCKER_INSTALL_DIR=${installDir}`);
     expect(log).toContain(`PI_WEB_DOCKER_DATA_DIR=${join(installDir, "data")}`);
+    expect(log).toContain(`PI_WEB_DOCKER_SKILLS_DIR=${skillsDir}`);
     expect(log).toContain("PI_WEB_PORT=12345");
     expect(log).toContain("PI_WEB_DOCKER_EXTRA_HOST_PATHS=/srv/pi-web-extra /opt/pi-web-extra");
     expect(log).toContain("PI_WEB_EXTRA_ZYPPER_PACKAGES=git-lfs jq");
@@ -652,21 +704,28 @@ describe("Docker command assets", () => {
       "HOSTEXEC_MODE=disabled",
     ]);
     const envFile = join(installDir, ".env");
+    const home = join(tempDir, "runtime-host-home");
+    const skillsDir = join(home, ".agents", "skills");
+    await mkdir(skillsDir, { recursive: true });
+    const resolvedSkillsDir = await realpath(skillsDir);
 
     const result = await execUtf8("sh", [
       join(repoRoot, "docker", "install.sh"),
       "--install-dir", installDir,
       "--asset-dir", join(repoRoot, "docker"),
       "--skip-compose",
-    ], { ...cleanProcessEnv(), PI_WEB_DOCKER_RUNTIME: "1" });
+    ], { ...cleanProcessEnv(), HOME: home, PI_WEB_DOCKER_RUNTIME: "1" });
 
     // Detection here would report this Linux test host. The recorded Mac setup
     // has to win, including the Docker Desktop socket path.
     const override = await readFile(join(installDir, "compose.override.yml"), "utf8");
-    expect(result.stderr).toContain("Reused the recorded PI WEB Docker host profile: mac-docker-desktop");
+    expect(result.stderr).toContain("Reused the recorded PI WEB container host profile: mac-docker-desktop");
     expect(override).toContain("source: '/Users/dev/.docker/run/docker.sock'");
+    expect(override).toContain(`source: '${resolvedSkillsDir}'\n    target: '${resolvedSkillsDir}'\n    read_only: true`);
+    expect(override).toContain(`source: '${resolvedSkillsDir}'\n    target: '/data/home/.agents/skills'\n    read_only: true`);
     expect(override).not.toContain("target: '/host'");
     expect(await readFile(envFile, "utf8")).toContain("PI_WEB_DOCKER_HOST_PROFILE=mac-docker-desktop");
+    expect(await readFile(envFile, "utf8")).toContain(`PI_WEB_DOCKER_SKILLS_DIR="${resolvedSkillsDir}"`);
     // The asset files still refresh, which is the point of the rerun.
     expect(await readFile(join(installDir, "compose.yml"), "utf8")).toContain("container.env");
   });
@@ -674,6 +733,10 @@ describe("Docker command assets", () => {
   dockerCommandIt("reuses the recorded Docker host setup for dev Compose inside a container", async () => {
     const devRoot = await createDevRepoFixture();
     const fakeDocker = await installFakeDocker();
+    const home = join(tempDir, "dev-host-home");
+    const skillsDir = join(home, ".agents", "skills");
+    await mkdir(skillsDir, { recursive: true });
+    const resolvedSkillsDir = await realpath(skillsDir);
     await mkdir(join(devRoot, ".pi-web"), { recursive: true });
     await writeFile(join(devRoot, ".pi-web", "docker-compose-dev.generated.env"), [
       "PI_WEB_UID=1234",
@@ -694,12 +757,16 @@ describe("Docker command assets", () => {
       ...cleanProcessEnv(),
       PATH: `${fakeDocker.binDir}:${process.env["PATH"] ?? ""}`,
       FAKE_DOCKER_LOG: fakeDocker.logPath,
+      HOME: home,
       PI_WEB_DOCKER_RUNTIME: "1",
       PI_WEB_DOCKER_RUNTIME_ENV_FILE: "/dev/null",
     });
 
     const override = await readFile(join(devRoot, ".pi-web", "docker-compose-dev.host.generated.yml"), "utf8");
     expect(override).toContain("source: '/Users/dev/.docker/run/docker.sock'");
+    expect(override).toContain(`source: '${resolvedSkillsDir}'\n    target: '${resolvedSkillsDir}'\n    read_only: true`);
+    expect(override).toContain(`source: '${resolvedSkillsDir}'\n    target: '/data/home/.agents/skills'\n    read_only: true`);
+    expect(await readFile(join(devRoot, ".pi-web", "docker-compose-dev.generated.env"), "utf8")).toContain(`PI_WEB_DOCKER_SKILLS_DIR=${resolvedSkillsDir}`);
     expect(override).not.toContain("target: '/host'");
   });
 

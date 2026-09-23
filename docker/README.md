@@ -125,6 +125,7 @@ Common environment variables written to `.env`:
 | `PI_WEB_DOCKER_REF` | Git ref used when `pi-web-docker update` refreshes Docker asset templates |
 | `PI_WEB_DOCKER_HOST_PROFILE`, `PI_WEB_DOCKER_SOCKET_SOURCE`, `HOSTEXEC_MODE` | Docker host facts: detected host profile, host Docker socket path, and host-command capability toggle |
 | `PI_WEB_DOCKER_EXTRA_HOST_PATHS` | optional whitespace-separated existing absolute paths to bind-mount read/write at the same path |
+| `PI_WEB_DOCKER_SKILLS_DIR` | optional host skills directory; defaults to `$HOME/.agents/skills` when it exists and is mounted read-only |
 | `PI_WEB_BIND_ADDR`, `PI_WEB_PORT` | host bind address and port |
 | `PI_WEB_VERSION` | npm version/range for `@jmfederico/pi-web`; Pi Coding Agent resolves from PI WEB's npm peer dependency |
 | `PI_WEB_OPENSUSE_IMAGE` | openSUSE base image used for the runtime build |
@@ -136,6 +137,8 @@ Common environment variables written to `.env`:
 | `HOSTEXEC_IMAGE` | helper image used by `hostexec` |
 
 Host-derived IDs and the Docker host facts are refreshed on every rerun **on the host** unless you explicitly override the IDs. A rerun from inside a container reuses the recorded values instead; see [Updating](#runtime-installupdate). User-facing values such as data directory, bind address, port, image names, upload limit, extra host paths, base image, Node.js settings, extra packages, and npm package selection are preserved from an existing `.env` unless you pass a flag or environment override.
+
+When the host's `$HOME/.agents/skills` directory exists, the installer and dev setup expose it to Pi's default global skills discovery path, `/data/home/.agents/skills`. The directory is mounted read-only; PI WEB also overlays the same host path read-only so the existing broad workspace mount cannot be used to write through the original path. Set `PI_WEB_DOCKER_SKILLS_DIR` to another existing absolute directory named `skills`, or set it to an empty value to disable the mount. Persist it in the runtime install's `.env` or the dev checkout's `.pi-web/docker-compose-dev.local.env`, then rerun the installer or `./docker/pi-web-docker --dev start` to recreate the services. This only provides the skill files; secrets such as `JIRA_PAT` must be configured separately.
 
 The installer also writes a generated `compose.override.yml` in the install directory. `pi-web-docker` loads the generated `.env` and Compose override explicitly for runtime commands and passes the generated `COMPOSE_PROJECT_NAME` to Docker Compose, so an unrelated ambient Compose project name cannot redirect lifecycle commands. The project name stays scoped to this lifecycle control path instead of entering web, terminal, or agent environments. Re-run `pi-web-docker install` or `pi-web-docker update` instead of editing generated files by hand. Extra environment variables for the containers go in `container.env` instead; see [Container environment](#container-environment).
 
