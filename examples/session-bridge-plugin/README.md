@@ -11,7 +11,7 @@ npm install
 npm run build
 ```
 
-Requires PI WEB `^2.202609.0` with the plugin data-directory and session-messaging APIs; the native companion is tested with Pi 0.85.1. During unreleased development, install the locally built PI WEB tarball instead of the registry dependency.
+Requires PI WEB `^2.202609.0` with the plugin data-directory and session-messaging APIs; the native companion is tested with Pi 1.2.0. During unreleased development, install the locally built PI WEB tarball instead of the registry dependency.
 
 On the target machine, install the absolute package directory through **Settings → Pi packages**. Enable **Workspace Reviews** and its companion, and activate the backend with a manual session-daemon restart **when safe, from outside any session it hosts**. Reload the browser afterward. A web/API restart alone does not activate a new backend.
 

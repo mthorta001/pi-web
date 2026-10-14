@@ -77,11 +77,17 @@ async function runNpm(npmCliPath, args, cwd) {
 }
 
 function packageTarballFilename(output) {
-  for (let jsonStart = output.indexOf("["); jsonStart >= 0; jsonStart = output.indexOf("[", jsonStart + 1)) {
+  for (let jsonStart = 0; jsonStart < output.length; jsonStart++) {
+    if (output[jsonStart] !== "[" && output[jsonStart] !== "{") continue;
     try {
       const parsed = JSON.parse(output.slice(jsonStart));
-      if (Array.isArray(parsed) && parsed.length === 1 && typeof parsed[0]?.filename === "string") {
-        return parsed[0].filename;
+      const results = Array.isArray(parsed)
+        ? parsed
+        : typeof parsed === "object" && parsed !== null
+          ? Object.values(parsed).flatMap((value) => Array.isArray(value) ? value : [value])
+          : [];
+      if (results.length === 1 && typeof results[0]?.filename === "string") {
+        return results[0].filename;
       }
     } catch {
       // Lifecycle output can precede npm's JSON payload; keep looking for the payload.

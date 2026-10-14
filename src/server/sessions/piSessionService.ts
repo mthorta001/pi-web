@@ -89,7 +89,7 @@ import { DEFAULT_EXTENSION_DIALOGS_TIMEOUT_MS } from "../../config.js";
 import { createSpawnSessionToolDefinition, type SpawnSessionInvocation, type SpawnSessionResult } from "./spawnSessionTool.js";
 import { createSubsessionToolDefinitions, type SpawnSubsessionInvocation, type SpawnSubsessionResult, type SubsessionCheckResult, type SubsessionReadQuery, type SubsessionReadResult, type SubsessionStatus, type SubsessionSummary, type SubsessionToolDeps } from "./spawnSubsessionTool.js";
 import { buildTranscriptView } from "./subsessionTranscript.js";
-import { annotateAssistantThinkingLevel, historyMessagesFromEntries } from "./transcriptMessages.js";
+import { annotateAssistantThinkingLevel, historyMessagesFromEntries, isUnattributedSystemMessage } from "./transcriptMessages.js";
 import { planSessionCleanup, summarizeSessionCleanupExecution, type NormalizedSessionCleanupRequest, type SessionCleanupPlan } from "./sessionCleanup.js";
 import type { SpawnTargetDecision, SpawnTargetResolver } from "./spawnTargetResolver.js";
 import {
@@ -4273,7 +4273,8 @@ export class PiSessionService implements SessionRouteService {
     }
     const unsubscribe = session.subscribe((event) => {
       if (getString(event, "type") === "message_end") this.observeModelAvailabilityMessage(getProperty(event, "message"));
-      this.events.publish(session.sessionId, toClientEvent(event, session.thinkingLevel));
+      const clientEvent = toClientEvent(event, session.thinkingLevel);
+      if (clientEvent !== undefined) this.events.publish(session.sessionId, clientEvent);
       this.publishActivityForEvent(session, event);
       const eventType = getString(event, "type");
       if (eventType === "agent_end") this.abortRunScopedExtensionDialogs(session.sessionId);
@@ -5271,7 +5272,7 @@ function finalAssistantText(messages: readonly unknown[]): string {
   return "";
 }
 
-function toClientEvent(event: unknown, thinkingLevel?: string): SessionUiEvent {
+function toClientEvent(event: unknown, thinkingLevel?: string): SessionUiEvent | undefined {
   const eventType = getString(event, "type");
   const assistantMessageEvent = getProperty(event, "assistantMessageEvent");
   if (eventType === "message_update" && getString(assistantMessageEvent, "type") === "text_delta") {
@@ -5297,6 +5298,7 @@ function toClientEvent(event: unknown, thinkingLevel?: string): SessionUiEvent {
   if (eventType === "message_end") {
     const message = getProperty(event, "message");
     if (message === undefined) return { type: "message.end" };
+    if (isUnattributedSystemMessage(message)) return undefined;
     return { type: "message.end", message: annotateAssistantThinkingLevel(message, thinkingLevel) };
   }
   return { type: "pi.event", eventType: eventType ?? "unknown" };

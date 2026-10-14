@@ -1,14 +1,14 @@
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 
-type TestSessionManager = {
+interface TestSessionManager {
   getSessionId(): string;
   getSessionFile(): string | undefined;
-};
+}
 
-type TestExtensionToolContextOptions = {
+interface TestExtensionToolContextOptions {
   model?: unknown;
   thinkingLevel?: unknown;
-};
+}
 
 export function fakeExtensionToolContext(
   sessionManager: TestSessionManager,
@@ -19,7 +19,7 @@ export function fakeExtensionToolContext(
   return {
     sessionManager,
     tools: [],
-    executeTool: async () => {
+    executeTool: () => {
       throw new Error("Nested tools are not configured in this test");
     },
     ...options,

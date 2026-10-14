@@ -1,24 +1,56 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MAX_FINDINGS, REVIEW_REPLY, REVIEW_REQUEST, reviewPrompt } from "./browser/protocol.js";
 
+interface ActiveReview { requestId: string; prompt: string; started: boolean; text: string; stopReason: string; error?: string }
+
 export default function companion(pi: ExtensionAPI): void {
   let context: ExtensionContext | undefined;
-  let active: { requestId: string; prompt: string; started: boolean; text: string; stopReason: string; error?: string } | undefined;
+  let active: ActiveReview | undefined;
   const reply = (requestId: string, result: object) => { pi.events.emit(REVIEW_REPLY, { requestId, ...result }); };
+  async function startPrompt(request: ActiveReview): Promise<void> {
+    const requestContext = context;
+    try {
+      if (requestContext === undefined) throw new Error("Review session is not ready");
+      const model = requestContext.model;
+      if (model === undefined) throw new Error("Select a Pi model before starting a review");
+      // Pi's ExtensionContext exposes the selected model as Model<any>; the registry accepts that same runtime model.
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- Pi guarantees this is the selected chat model.
+      const auth = await requestContext.modelRegistry.getApiKeyAndHeaders(model);
+      if (active !== request) return;
+      if (request.error !== undefined) throw new Error(request.error);
+      if (context !== requestContext) throw new Error("The selected Pi model changed while preparing this review; retry when the session is idle");
+      if (!auth.ok) throw new Error(`Pi authentication is not ready: ${auth.error}`);
+      if (!requestContext.isIdle() || requestContext.hasPendingMessages()) {
+        throw new Error("The session became busy while preparing this review; retry when idle");
+      }
+      reply(request.requestId, { status: "accepted" });
+      pi.sendUserMessage(request.prompt);
+    } catch (error) {
+      if (active === request) active = undefined;
+      reply(request.requestId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
+    }
+  }
   pi.on("session_start", (_event, ctx) => { context = ctx; });
+  pi.on("model_select", (_event, ctx) => { context = ctx; });
   pi.on("session_shutdown", () => {
     if (active) reply(active.requestId, { status: "failed", error: "Review interrupted by session shutdown or reload" });
     active = undefined;
     context = undefined;
   });
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", (event, ctx) => {
+    context = ctx;
     if ("messageType" in event && event.messageType !== "user") return;
     if (!active) return;
     if (!active.started && event.prompt === active.prompt) active.started = true;
     else active.error = "Another prompt interfered with this review; findings were not saved";
   });
   pi.on("message_start", (event) => {
-    if (!active || event.message.role !== "user") return;
+    if (!active) return;
+    if (event.message.role === "custom") {
+      active.error = "A custom message interfered with this review; findings were not saved";
+      return;
+    }
+    if (event.message.role !== "user") return;
     const content = event.message.content;
     const text = typeof content === "string" ? content : content.filter((part) => part.type === "text").map((part) => part.text).join("");
     if (text !== active.prompt) active.error = "Another user message interfered with this review";
@@ -36,7 +68,7 @@ export default function companion(pi: ExtensionAPI): void {
   });
   // agent_end can precede automatic retries/compaction. Settlement is the final boundary.
   pi.on("agent_settled", () => {
-    if (active?.started !== true) return;
+    if (!active || (!active.started && active.error === undefined)) return;
     const result = active;
     active = undefined;
     const error = result.error ?? (result.stopReason !== "stop" || !result.text.trim()
@@ -53,14 +85,8 @@ export default function companion(pi: ExtensionAPI): void {
       reply(requestId, { status: "failed", error: "Companion not ready or session busy; use a new review session" });
       return;
     }
-    const prompt = reviewPrompt(requestId);
-    active = { requestId, prompt, started: false, text: "", stopReason: "" };
-    try {
-      pi.sendUserMessage(prompt);
-      reply(requestId, { status: "accepted" });
-    } catch (error) {
-      active = undefined;
-      reply(requestId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
-    }
+    const request: ActiveReview = { requestId, prompt: reviewPrompt(requestId), started: false, text: "", stopReason: "" };
+    active = request;
+    void startPrompt(request);
   });
 }

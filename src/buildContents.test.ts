@@ -360,9 +360,14 @@ function execUtf8(file: string, args: string[], cwd: string, timeoutMs: number):
 
 function packageFilePaths(output: string): string[] {
   const parsed: unknown = JSON.parse(output);
-  if (!Array.isArray(parsed) || parsed.length !== 1) throw new Error("npm pack returned an unexpected result");
+  const results = Array.isArray(parsed)
+    ? parsed.map((value: unknown) => value)
+    : isRecord(parsed)
+      ? Object.values(parsed).flatMap((value) => Array.isArray(value) ? value.map((item: unknown) => item) : [value])
+      : [];
+  if (results.length !== 1) throw new Error("npm pack returned an unexpected result");
 
-  const packResult: unknown = parsed[0];
+  const packResult: unknown = results[0];
   if (!isRecord(packResult)) throw new Error("npm pack result was not an object");
   const filesValue = packResult["files"];
   if (!Array.isArray(filesValue)) throw new Error("npm pack result did not include files");
