@@ -43,18 +43,35 @@ function streamThatErrors(): StreamFn {
 }
 
 describe("sessionNameGenerator", () => {
-  it("generates a session name by calling the injected streamFn", async () => {
-    const calls: unknown[] = [];
+  it("streams a normalized title context with a leading system instruction", async () => {
+    const contexts: Parameters<StreamFn>[1][] = [];
     const stream = streamThatCompletes('Title: "Fix the bug"');
     const streamFn: StreamFn = (model, context, options) => {
-      calls.push({ model, context, options });
+      contexts.push(context);
       return stream(model, context, options);
     };
 
     const name = await generateShortSessionName(streamFn, fakeModel(), "Please fix the login bug");
 
     expect(name).toBe("Fix the bug");
-    expect(calls).toHaveLength(1);
+    expect(contexts).toHaveLength(1);
+    expect(contexts[0]?.messages[0]).toMatchObject({ role: "system" });
+    expect(JSON.stringify(contexts[0]?.messages[0])).toContain("Generate a concise title for a coding-agent chat session");
+  });
+
+  it("passes the raw context to legacy Pi stream functions without normalizeContext", async () => {
+    let context: Parameters<StreamFn>[1] | undefined;
+    const stream = streamThatCompletes("Legacy title");
+    const streamFn: StreamFn = (model, streamContext, options) => {
+      context = streamContext;
+      return stream(model, streamContext, options);
+    };
+
+    const name = await generateShortSessionName(streamFn, fakeModel(), "Please fix the login bug", null);
+
+    expect(name).toBe("Legacy title");
+    expect(context?.messages[0]).toMatchObject({ role: "user" });
+    expect(JSON.stringify(context)).toContain("Generate a concise title for a coding-agent chat session");
   });
 
   it("returns undefined when the stream reports an error", async () => {

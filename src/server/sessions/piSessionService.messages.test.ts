@@ -78,6 +78,27 @@ describe("PiSessionService", () => {
       await service.dispose();
     });
 
+    it("does not publish Pi 1.2 system-prompt message.end events", async () => {
+      const { fake, service, events } = messagesService([], { thinkingLevel: "high" });
+      try {
+        await service.status(sessionRef("session-1"));
+
+        fake.emit({
+          type: "message_end",
+          message: { role: "system", content: "", sections: [{ text: "private system prompt" }], toolsAdded: [{ name: "read" }] },
+        });
+        fake.emit({ type: "message_end", message: { role: "user", content: [{ type: "text", text: "visible request" }] } });
+
+        const messageEnds = events.sessionEvents.map(({ event }) => event).filter((event) => event.type === "message.end");
+        expect(messageEnds).toEqual([
+          { type: "message.end", message: { role: "user", content: [{ type: "text", text: "visible request" }] } },
+        ]);
+        expect(JSON.stringify(messageEnds)).not.toContain("private system prompt");
+      } finally {
+        await service.dispose();
+      }
+    });
+
     it("annotates the join-time stream snapshot partial with the current thinking level", async () => {
       const streamingMessage = {
         role: "assistant",

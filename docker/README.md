@@ -327,6 +327,7 @@ From the repository root, use the canonical Docker command so the same fail-clos
 ```
 
 The command creates `.pi-web/docker-compose-dev.local.env` on first run, writes `.pi-web/docker-compose-dev.generated.env` and `.pi-web/docker-compose-dev.host.generated.yml`, then runs Docker Compose with `docker/compose.dev.yml` plus that generated host override. The generated environment includes the host repository root as `PI_WEB_DOCKER_DEV_REPO_ROOT`, and the generated override mounts that path back into the containers so Docker helper commands can run Compose from the same absolute path. Edit only the `.local.env` file for persistent dev settings; the `.generated.env` and `.host.generated.yml` files are refreshed by the command. Extra environment variables for the dev containers go in the shared [`container.env`](#container-environment).
+Set `PI_WEB_NPM_REGISTRY` in `.pi-web/docker-compose-dev.local.env` (or in the shell on first generation) to select a registry for the development image's `npm ci`; leave it unset or empty to use npm's default registry. PI WEB does not force a registry inside the running containers. To configure npm commands run there, set `NPM_CONFIG_REGISTRY` in the shared `container.env`.
 
 Values used by the command are resolved in this order:
 

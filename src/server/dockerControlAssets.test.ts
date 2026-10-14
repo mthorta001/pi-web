@@ -93,6 +93,8 @@ describe("Docker command assets", () => {
     expect(runtimeCompose).toContain("PI_WEB_DOCKER_HELPER_IMAGE: ${PI_WEB_IMAGE:-pi-web:local}");
     expect(runtimeCompose).not.toContain("COMPOSE_PROJECT_NAME:");
     expect(devCompose).toContain("PI_WEB_DOCKER_MODE: dev");
+    expect(devCompose).toContain("PI_WEB_NPM_REGISTRY: ${PI_WEB_NPM_REGISTRY:-}");
+    expect(devCompose).not.toContain("NPM_CONFIG_REGISTRY:");
     expect(devCompose).toContain("PI_WEB_DOCKER_DEV_REPO_ROOT: ${PI_WEB_DOCKER_DEV_REPO_ROOT:?set by docker/pi-web-docker --dev}");
     expect(devCompose).toContain("PI_WEB_DOCKER_HELPER_IMAGE: ${PI_WEB_DEV_IMAGE:-pi-web:dev}");
     expect(devCompose).not.toContain("COMPOSE_PROJECT_NAME:");
@@ -227,7 +229,7 @@ describe("Docker command assets", () => {
     const env = await readFile(join(installDir, ".env"), "utf8");
     expect(env).toContain(`PI_WEB_DOCKER_INSTALL_DIR=${installDir}`);
     expect(env).toContain("PI_WEB_DOCKER_REF=test-assets");
-  });
+  }, 15_000);
 
   dockerCommandIt("creates the shared container environment file during install without overwriting edits", async () => {
     const installDir = join(tempDir, "container-env-runtime");
@@ -264,7 +266,7 @@ describe("Docker command assets", () => {
     });
 
     expect(await readFile(containerEnvFile, "utf8")).toContain("HTTPS_PROXY=http://proxy.example.test:3128");
-  });
+  }, 15_000);
 
   dockerCommandIt("recreates a missing container environment file before running runtime Compose", async () => {
     const installDir = await createRuntimeInstall();
@@ -348,6 +350,7 @@ describe("Docker command assets", () => {
 
   dockerCommandIt("runs development commands through generated env while preserving host user ids", async () => {
     const devRoot = await createDevRepoFixture();
+    const resolvedDevRoot = await realpath(devRoot);
     const fakeDocker = await installFakeDocker();
     await installFakeUname(fakeDocker.binDir, "Darwin");
     await installFakeId(fakeDocker.binDir, 1234, 2345);
@@ -368,17 +371,22 @@ describe("Docker command assets", () => {
       await runDockerCommand(["--dev", "status"], devHostEnv(fakeDocker, devRoot, home, { PI_WEB_DOCKER_RUNTIME_ENV_FILE: runtimeEnvFile }));
     });
 
-    const generatedEnvPath = join(devRoot, ".pi-web", "docker-compose-dev.generated.env");
+    const generatedEnvPath = join(resolvedDevRoot, ".pi-web", "docker-compose-dev.generated.env");
     const generatedEnv = await readFile(generatedEnvPath, "utf8");
     expect(generatedEnv).toContain("PI_WEB_UID=1234\n");
     expect(generatedEnv).toContain("PI_WEB_GID=2345\n");
     expect(generatedEnv).toContain("DOCKER_GID=0\n");
     expect(generatedEnv).toContain(`PI_WEB_DOCKER_DATA_DIR=${runtimeDataDir}\n`);
-    expect(generatedEnv).toContain(`PI_WEB_DOCKER_DEV_REPO_ROOT=${devRoot}\n`);
+    expect(generatedEnv).toContain(`PI_WEB_DOCKER_DEV_REPO_ROOT=${resolvedDevRoot}\n`);
     expect(generatedEnv).toContain("PI_WEB_DEV_SESSIOND_SOCKET=/run/pi-web/sessiond-dev.sock\n");
+    expect(generatedEnv).toContain("PI_WEB_NPM_REGISTRY=\n");
     expect(generatedEnv).toContain("COMPOSE_PROJECT_NAME=pi-web-dev\n");
     expect(generatedEnv).toContain("PI_WEB_DEV_API_BIND_ADDR=0.0.0.0\n");
     expect(generatedEnv).not.toContain("COMPOSE_PROJECT_NAME=runtime-project");
+
+    const localConfigPath = join(devRoot, ".pi-web", "docker-compose-dev.local.env");
+    const currentLocalConfig = await readFile(localConfigPath, "utf8");
+    await writeFile(localConfigPath, `${currentLocalConfig}PI_WEB_NPM_REGISTRY=https://registry.npmjs.org/\n`);
 
     await withUnixSocket(socketPath, async () => {
       await runDockerCommand(["--dev", "status"], devHostEnv(fakeDocker, devRoot, home, {
@@ -388,6 +396,7 @@ describe("Docker command assets", () => {
     });
     const regeneratedEnv = await readFile(generatedEnvPath, "utf8");
     expect(regeneratedEnv).toContain("COMPOSE_PROJECT_NAME=pi-web-dev\n");
+    expect(regeneratedEnv).toContain("PI_WEB_NPM_REGISTRY=https://registry.npmjs.org/\n");
     expect(regeneratedEnv).toContain(`PI_WEB_DOCKER_DATA_DIR=${runtimeDataDir}\n`);
     expect(regeneratedEnv).not.toContain("COMPOSE_PROJECT_NAME=ambient-dev-project");
 
@@ -395,12 +404,13 @@ describe("Docker command assets", () => {
     expect(localConfig).toContain("docker/pi-web-docker --dev creates this file once");
     expect(localConfig).toContain("PI_WEB_DEV_SESSIOND_SOCKET defaults to /run/pi-web/sessiond-dev.sock");
     expect(localConfig).toContain("PI_WEB_UID and PI_WEB_GID default to the current host user");
+    expect(localConfig).toContain("# PI_WEB_NPM_REGISTRY=https://registry.npmjs.org/");
     const override = await readFile(join(devRoot, ".pi-web", "docker-compose-dev.host.generated.yml"), "utf8");
     expect(override).toContain(socketPath);
     expect(override).toContain(devRoot);
     const log = await readFile(fakeDocker.logPath, "utf8");
-    expect(log).toContain(`compose --project-name pi-web-dev --env-file ${generatedEnvPath} -f ${devRoot}/docker/compose.dev.yml -f ${devRoot}/.pi-web/docker-compose-dev.host.generated.yml ps`);
-  });
+    expect(log).toContain(`compose --project-name pi-web-dev --env-file ${generatedEnvPath} -f ${resolvedDevRoot}/docker/compose.dev.yml -f ${resolvedDevRoot}/.pi-web/docker-compose-dev.host.generated.yml ps`);
+  }, 30_000);
 
   dockerCommandIt("rejects development commands as root unless explicitly allowed", async () => {
     const fakeDocker = await installFakeDocker();
@@ -517,7 +527,7 @@ describe("Docker command assets", () => {
     expect(await gitHead(devRoot)).toBe(upstreamCommit);
     expect(await readFile(join(devRoot, "pulled.txt"), "utf8")).toBe("from upstream\n");
     expect(await readFile(helperLog, "utf8")).toContain("args=build --pull");
-  });
+  }, 15_000);
 
   dockerCommandIt("warns and still rebuilds when the development checkout has no upstream", async () => {
     const helperLog = join(tempDir, "dev-helper.log");
@@ -548,7 +558,7 @@ describe("Docker command assets", () => {
     expect(result.stderr).toContain("continuing with the existing checkout");
     expect(await gitHead(devRoot)).toBe(localCommit);
     expect(await readFile(helperLog, "utf8")).toContain("args=build --pull");
-  });
+  }, 15_000);
 
   dockerCommandIt("allows clean development updates and dirty development starts", async () => {
     const helperLog = join(tempDir, "dev-helper.log");

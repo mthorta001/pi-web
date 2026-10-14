@@ -1,4 +1,5 @@
-import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
+import * as piAi from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, Context, Model } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 
 const SESSION_NAME_TIMEOUT_MS = 10_000;
@@ -13,17 +14,26 @@ export function deterministicSessionName(firstMessage: unknown): string | undefi
   return relayHandoffSessionName(firstMessage.trimStart());
 }
 
-export async function generateShortSessionName<TApi extends Api>(streamFn: StreamFn, model: Model<TApi>, firstMessage: string): Promise<string | undefined> {
+type StreamContext = Parameters<StreamFn>[1];
+type ContextNormalizer = ((context: Context) => StreamContext) | null;
+
+export async function generateShortSessionName<TApi extends Api>(
+  streamFn: StreamFn,
+  model: Model<TApi>,
+  firstMessage: string,
+  contextNormalizer: ContextNormalizer = defaultContextNormalizer(),
+): Promise<string | undefined> {
+  const context: Context = {
+    systemPrompt: "Generate a concise title for a coding-agent chat session. Return only the title, with no quotes or punctuation wrapper.",
+    messages: [{
+      role: "user",
+      content: `Create a 2-6 word title for this request:\n\n${truncateInput(firstMessage)}`,
+      timestamp: Date.now(),
+    }],
+  };
   const stream = await streamFn(
     model,
-    {
-      systemPrompt: "Generate a concise title for a coding-agent chat session. Return only the title, with no quotes or punctuation wrapper.",
-      messages: [{
-        role: "user",
-        content: `Create a 2-6 word title for this request:\n\n${truncateInput(firstMessage)}`,
-        timestamp: Date.now(),
-      }],
-    },
+    streamContext(context, contextNormalizer),
     {
       maxTokens: 24,
       reasoning: "minimal",
@@ -89,6 +99,17 @@ function truncateRelayName(relayName: string, maxLength: number): string {
   if (relayName.length <= maxLength) return relayName;
   const truncated = relayName.slice(0, maxLength).replace(/[\s._-]+$/g, "").trim();
   return truncated === "" ? relayName.slice(0, maxLength).trim() : truncated;
+}
+
+function defaultContextNormalizer(): ContextNormalizer {
+  return typeof piAi.normalizeContext === "function" ? piAi.normalizeContext : null;
+}
+
+function streamContext(context: Context, contextNormalizer: ContextNormalizer): StreamContext {
+  if (contextNormalizer !== null) return contextNormalizer(context);
+  // Supported Pi 0.85 peers accept Context directly; only Pi 1.2 adds TranscriptContext's brand.
+  // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- the runtime version check above selects the legacy, unbranded stream contract.
+  return context as StreamContext;
 }
 
 function textFromAssistant(message: AssistantMessage): string {

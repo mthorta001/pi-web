@@ -11,7 +11,7 @@ import { createTestModelRuntime, testModel } from "./piSessionService.testSuppor
 
 // Real copied package discovery, native message hooks, backend event connection and disk writes.
 // Only host admission and provider transport are replaced; no live credentials or daemon used.
-it.each(["stop", "error", "aborted", "length", "empty", "interference", "tools", "tool-error"] as const)("copied review package records native %s outcome", async (outcome) => {
+it.each(["stop", "error", "aborted", "length", "empty", "interference", "tools", "tool-error", "custom-event", "custom-interference", "no-auth"] as const)("copied review package records native %s outcome", async (outcome) => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-native-"));
   const packageRoot = join(root, "package");
   // Exercise package discovery without copying a developer's installed dependencies/build output.
@@ -21,7 +21,7 @@ it.each(["stop", "error", "aborted", "length", "empty", "interference", "tools",
   const manifest: unknown = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
   expect(manifest).toMatchObject({ pi: { extensions: ["./src/companion.ts"] } });
   const modelRuntime = await createTestModelRuntime();
-  await modelRuntime.setRuntimeApiKey("anthropic", "isolated-test-key");
+  if (outcome !== "no-auth") await modelRuntime.setRuntimeApiKey("anthropic", "isolated-test-key");
   const settingsManager = SettingsManager.inMemory({ packages: [packageRoot], retry: { enabled: false }, compaction: { enabled: false } });
   const bus = createEventBus();
   const loader = new DefaultResourceLoader({
@@ -38,15 +38,35 @@ it.each(["stop", "error", "aborted", "length", "empty", "interference", "tools",
   });
   const hookErrors = vi.fn();
   await session.bindExtensions({ onError: hookErrors });
+  const authCheck = outcome === "no-auth"
+    ? vi.spyOn(session.extensionRunner.createContext().modelRegistry, "getApiKeyAndHeaders")
+      .mockResolvedValue({ ok: false, error: "No API key found for anthropic" })
+    : undefined;
   const connections = new PiSessionEventConnections();
   connections.register(session, bus);
   const lifetime = new AbortController();
   let calls = 0;
-  session.agent.streamFunction = () => {
+  session.agent.streamFunction = async () => {
     calls++;
     if (outcome === "interference" && calls === 1) void session.followUp("Unrelated user request");
+    if (outcome === "custom-event" && calls === 1) {
+      await session.extensionRunner.emitBeforeAgentStart({
+        messageType: "custom",
+        message: { role: "custom", customType: "test", content: "unrelated extension message", display: true, timestamp: Date.now() },
+      }, { cwd: root });
+    }
+    if (outcome === "custom-interference" && calls === 1) {
+      await session.extensionRunner.emit({
+        type: "message_start",
+        message: { role: "custom", customType: "test", content: "unrelated extension message", display: true, timestamp: Date.now() },
+      });
+    }
     const usesTool = outcome === "tools" || outcome === "tool-error";
-    const stopReason = usesTool ? (calls === 1 ? "toolUse" : "stop") : outcome === "empty" || outcome === "interference" ? "stop" : outcome;
+    const stopReason = usesTool
+      ? (calls === 1 ? "toolUse" : "stop")
+      : outcome === "error" || outcome === "aborted" || outcome === "length"
+        ? outcome
+        : "stop";
     const message: AssistantMessage = {
       role: "assistant", content: usesTool && calls === 1
         ? [{ type: "toolCall", id: "read-source", name: "read", arguments: { path: join(packageRoot, outcome === "tools" ? "package.json" : "missing-file") } }]
@@ -85,19 +105,26 @@ it.each(["stop", "error", "aborted", "length", "empty", "interference", "tools",
     await vi.waitFor(async () => {
       const saved = await activation.peer.request({ ...context, operation: "read", input: record.id });
       if (!isReview(saved)) throw new Error("Invalid saved review");
-      expect(saved).toMatchObject({ status: outcome === "stop" || outcome === "tools" ? "completed" : "failed" });
+      expect(saved).toMatchObject({ status: outcome === "stop" || outcome === "tools" || outcome === "custom-event" ? "completed" : "failed" });
       if (outcome === "stop") expect(saved).toMatchObject({ text: "Findings: src/file.ts:4 introduces a regression" });
       if (outcome === "error") expect(saved).toMatchObject({ text: "synthetic provider failure" });
       if (outcome === "interference") expect(saved.text).toContain("interfered");
       if (outcome === "tool-error") expect(saved.text).toContain("Review tool failed: read");
+      if (outcome === "custom-interference") expect(saved.text).toContain("custom message interfered");
+      if (outcome === "no-auth") expect(saved.text).toContain("No API key found");
     });
     expect(hookErrors).not.toHaveBeenCalled();
-    expect(session.messages[0]).toMatchObject({ role: "user" });
+    if (outcome === "no-auth") {
+      expect(calls).toBe(0);
+      expect(session.messages.some((message) => message.role === "user")).toBe(false);
+    }
+    else expect(session.messages.find((message) => message.role !== "system")).toMatchObject({ role: "user" });
   } finally {
     lifetime.abort();
     await activation.dispose();
     await session.abort();
     session.dispose();
+    authCheck?.mockRestore();
     await rm(root, { recursive: true, force: true });
   }
 });

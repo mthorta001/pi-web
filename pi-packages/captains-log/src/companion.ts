@@ -1,17 +1,49 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MAX_FINDINGS, UUID, CAPTAIN_REPLY, CAPTAIN_REQUEST, SOURCE_REQUEST, SOURCE_REPLY, PIRATE_INTRO, PIRATE_MARKER, captainPrompt } from "./browser/protocol.js";
 
+interface ActiveRequest { requestId: string; prompt: string; nextPrompt?: string; started: boolean; text: string; stopReason: string; error?: string }
+
 export default function companion(pi: ExtensionAPI): void {
   let context: ExtensionContext | undefined;
-  let active: { requestId: string; prompt: string; nextPrompt?: string; started: boolean; text: string; stopReason: string; error?: string } | undefined;
+  let active: ActiveRequest | undefined;
   const reply = (requestId: string, result: object) => { pi.events.emit(CAPTAIN_REPLY, { requestId, ...result }); };
+  async function startPrompt(request: ActiveRequest, startNewSession: boolean): Promise<void> {
+    const requestContext = context;
+    try {
+      if (requestContext === undefined) throw new Error("Captain's Log session is not ready");
+      const model = requestContext.model;
+      if (model === undefined) throw new Error("Select a Pi model before using Captain's Log");
+      // Pi's ExtensionContext exposes the selected model as Model<any>; the registry accepts that same runtime model.
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- Pi guarantees this is the selected chat model.
+      const auth = await requestContext.modelRegistry.getApiKeyAndHeaders(model);
+      if (active !== request) return;
+      if (request.error !== undefined) throw new Error(request.error);
+      if (context !== requestContext) throw new Error("The selected Pi model changed while preparing this request; retry when the session is idle");
+      if (!auth.ok) throw new Error(`Pi authentication is not ready: ${auth.error}`);
+      if (!requestContext.isIdle() || requestContext.hasPendingMessages()) {
+        throw new Error("The session became busy while preparing this Captain request; retry when idle");
+      }
+      if (startNewSession) {
+        pi.setSessionName("Captain's Log");
+        pi.appendEntry("captains-log:request", { requestId: request.requestId });
+        reply(request.requestId, { status: "accepted" });
+      }
+      pi.sendUserMessage(request.prompt);
+    } catch (error) {
+      if (active === request) active = undefined;
+      reply(request.requestId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
+    }
+  }
   pi.on("session_start", (_event, ctx) => { context = ctx; });
+  pi.on("model_select", (_event, ctx) => { context = ctx; });
   pi.on("session_shutdown", () => {
     if (active) reply(active.requestId, { status: "failed", error: "Captain request interrupted by session shutdown or reload" });
     active = undefined;
     context = undefined;
   });
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", (event, ctx) => {
+    context = ctx;
+    if ("messageType" in event && event.messageType !== "user") return;
     if (!active) return;
     if (!active.started && event.prompt === active.prompt) {
       active.started = true;
@@ -21,7 +53,12 @@ export default function companion(pi: ExtensionAPI): void {
     else active.error = "Another prompt interfered with this Captain request; translation was not saved";
   });
   pi.on("message_start", (event) => {
-    if (!active || event.message.role !== "user") return;
+    if (!active) return;
+    if (event.message.role === "custom") {
+      active.error = "A custom message interfered with this Captain request; translation was not saved";
+      return;
+    }
+    if (event.message.role !== "user") return;
     const content = event.message.content;
     const text = typeof content === "string" ? content : content.filter((part) => part.type === "text").map((part) => part.text).join("");
     if (text !== active.prompt) active.error = "Another user message interfered with this Captain request";
@@ -39,16 +76,16 @@ export default function companion(pi: ExtensionAPI): void {
   });
   // agent_end can precede automatic retries/compaction. Settlement is the final boundary.
   pi.on("agent_settled", () => {
-    if (active?.started !== true) return;
+    if (!active || (!active.started && active.error === undefined)) return;
     const result = active;
     active = undefined;
     const error = result.error ?? (result.stopReason !== "stop" || !result.text.trim()
       ? "Captain request ended without a successful final text response" : result.text.length > MAX_FINDINGS
         ? "Captain reply exceeded the storage limit" : undefined);
     if (error === undefined && result.nextPrompt !== undefined) {
-      active = { requestId: result.requestId, prompt: result.nextPrompt, started: false, text: "", stopReason: "" };
-      try { pi.sendUserMessage(active.prompt); }
-      catch (failure) { active = undefined; reply(result.requestId, { status: "failed", error: String(failure) }); }
+      const followup: ActiveRequest = { requestId: result.requestId, prompt: result.nextPrompt, started: false, text: "", stopReason: "" };
+      active = followup;
+      void startPrompt(followup, false);
       return;
     }
     reply(result.requestId, error !== undefined ? { status: "failed", error } : { status: "completed", text: result.text });
@@ -88,15 +125,8 @@ export default function companion(pi: ExtensionAPI): void {
     const introduced = context.sessionManager.getEntries().some((entry) => entry.type === "custom" && entry.customType === PIRATE_MARKER);
     const translation = captainPrompt(data.text);
     const prompt = introduced ? translation : PIRATE_INTRO;
-    active = { requestId, prompt, ...(introduced ? {} : { nextPrompt: translation }), started: false, text: "", stopReason: "" };
-    try {
-      pi.setSessionName("Captain's Log");
-      pi.appendEntry("captains-log:request", { requestId });
-      reply(requestId, { status: "accepted" });
-      pi.sendUserMessage(prompt);
-    } catch (error) {
-      active = undefined;
-      reply(requestId, { status: "failed", error: error instanceof Error ? error.message : String(error) });
-    }
+    const request: ActiveRequest = { requestId, prompt, ...(introduced ? {} : { nextPrompt: translation }), started: false, text: "", stopReason: "" };
+    active = request;
+    void startPrompt(request, true);
   });
 }

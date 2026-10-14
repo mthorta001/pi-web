@@ -119,6 +119,9 @@ write_initial_dev_config() {
 #
 # Shared Docker/runtime-style defaults may also be set here:
 # PI_WEB_CONTAINER_ENGINE=podman
+# Optional registry override for npm ci when building the dev image.
+# Leave it unset or empty to use npm's default registry.
+# PI_WEB_NPM_REGISTRY=https://registry.npmjs.org/
 # PI_WEB_DOCKER_DATA_DIR=/absolute/path/to/pi-web-docker/data
 # PI_WEB_DOCKER_AGENT_DIR=/absolute/path/to/.pi/agent
 # PI_WEB_DOCKER_SKILLS_DIR=/absolute/path/to/.agents/skills

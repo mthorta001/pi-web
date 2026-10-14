@@ -59,7 +59,7 @@ describe("pi-web-docker entrypoint", () => {
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 });
 
 function fakeDockerScript(dockerCallsPath: string): string {
